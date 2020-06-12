@@ -1,9 +1,9 @@
 # Menu
 menu:
   Home: /
-  Archives: /archives/
-  Gallery: /gallery/
-  About: /about/
+  深度学习: /deeplearning/
+  Linux系统: /linux/
+  人生百态: /lifestyle/
 rss: /atom.xml
 
 
@@ -42,7 +42,7 @@ feed:
   order_by: -date
 
 # Local search
-search_text: Search
+search_text: 搜 索
 # Dependencies: https://github.com/flashlab/hexo-generator-search
 local_search:
   enable: true
