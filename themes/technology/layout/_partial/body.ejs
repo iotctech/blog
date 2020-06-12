@@ -1,0 +1,56 @@
+<canvas id="canvas"></canvas>
+<div class="technology-body">
+    <div class="technology-frame">
+      <section>
+        <div></div>
+        <div></div>
+        <div></div>
+      </section>
+      <section>
+        <div></div>
+        <div></div>
+        <div></div>
+      </section>
+      <section>
+        <div></div>
+        <div></div>
+        <div></div>
+      </section>
+      <section>
+        <div></div>
+        <div></div>
+        <div></div>
+      </section>
+    </div>
+    <section class="technology-circle">
+      <div class="wrap">
+        <div class="inner">
+          <div class="middle">
+            <div class="middle2">
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="technology-nav">
+      <nav class="nav-box">
+        <section>
+          <a data-href="profile-page" data-color="pink" href="/about/">About me</a>
+          <a class="nav-item-search" data-href="memories-page" data-color="light-pink" href="javascript:;">Search</a>
+        </section>
+        <section>
+          <a data-href="history-page" data-color="light-purple" href="/gallery/">Gallery</a>
+          <a data-href="product-page" data-color="purple" href="/archives/">Archives</a>
+        </section>
+      </nav>
+      <div class="message"><h3>科幻世界</h3></div>
+    </section>
+    <div class="video-inner text-center text-white">
+      <h1 style="text-align: center"><%= config.title %></h1>
+      <p><%= config.subtitle %></p>
+      <div class="brand-wapper" ><img src="<%- theme.technology.brand %>" class="brand" alt="<%= config.title %>"></div>
+    </div>
+  </div>
+  <div class="search-form-wrap">
+    <%- partial('post/search') %>
+  </div>

@@ -1,0 +1,25 @@
+{
+  "name": "technology",
+  "version": "1.0.0",
+  "description": "technology 是基于 Landscape 中的功能设计的一个 Hexo 主题",
+  "main": "index.js",
+  "dependencies": {},
+  "devDependencies": {},
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guxuelong/hexo-theme-technology.git"
+  },
+  "keywords": [
+    "technology",
+    "light"
+  ],
+  "author": "zhwangart",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/guxuelong/hexo-theme-technology/issues"
+  },
+  "homepage": "https://github.com/guxuelong/hexo-theme-technology#readme"
+}
