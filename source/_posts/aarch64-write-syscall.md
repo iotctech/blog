@@ -2,7 +2,11 @@
 title: aarch64-write-syscall
 date: 2020-06-14 13:31:42
 tags:
+ - aarch64 linux write 系统调用
+categories:
+ - [linux]
 ---
+
 
 > 参考文章
 ```
