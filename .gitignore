@@ -1,4 +1,5 @@
 .DS_Store
+/themes/technology/_config.yml
 Thumbs.db
 db.json
 *.log
