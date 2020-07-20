@@ -55,9 +55,9 @@ local_search:
 
 # Gitalk
 gitalk:
-  enable: false # true
-  clientID: # GitHub Application Client ID
-  clientSecret: # Client Secret
-  repo: # Repository name
-  owner: # GitHub ID
-  admin: # GitHub ID
+  enable: true # true
+  clientID: 8db6a5d7c75b7cabd2c0 # GitHub Application Client ID
+  clientSecret: ec1e19ba353938ad94cd9c664ca81a385f90fbfb # Client Secret
+  repo: blog # Repository name
+  owner: iotctech # GitHub ID
+  admin: iotctech # GitHub ID
