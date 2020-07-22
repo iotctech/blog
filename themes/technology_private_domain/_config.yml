@@ -9,14 +9,14 @@ rss: /atom.xml
 
 # Miscellaneous
 favicon: /favicon.ico
-brand: /blog/images/hexo.png
+brand: /images/hexo.png
 
 # technology Video
 # Because I put videos in multiple formats on the same path, I just labeled the path here.
 technology:
   overlay: true
-  path: /blog/images/technology/
-  brand: /blog/images/hexo-inverted.png
+  path: /images/technology/
+  brand: /images/hexo-inverted.png
 
 # Content
 excerpt_link: Read More...
@@ -56,21 +56,8 @@ local_search:
 # Gitalk
 gitalk:
   enable: true # true
-  clientID: xxxxxxxxxxx # GitHub Application Client ID
-  clientSecret: xxxxxxxxxxxxxxxxxxxx # Client Secret
+  clientID: 8db6a5d7c75b7cabd2c0 # GitHub Application Client ID
+  clientSecret: 841122ecefd4680526e418f6c7c692e479ced800 # Client Secret
   repo: blog # Repository name
   owner: iotctech # GitHub ID
   admin: iotctech # GitHub ID
-
-# 萌妹子
-live2d:
-  enable: false
-  scriptFrom: local
-  model:
-    use: live2d-widget-model-miku
-  display:
-    position: right
-    width: 150
-    height: 300
-  mobile:
-    show: true

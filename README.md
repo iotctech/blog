@@ -30,6 +30,9 @@ npm install hexo-deployer-git --save
 npm install hexo-renderer-pug --save
 npm install hexo-renderer-sass --save
 
+# 萌妹子
+npm install --save hexo-helper-live2d
+
 # 图片
 npm install https://github.com/iotctech/hexo-asset-image --save
 ```

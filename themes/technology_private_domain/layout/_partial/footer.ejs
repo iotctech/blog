@@ -1,0 +1,15 @@
+<footer class="footer">
+  <% if (theme.sidebar === 'bottom'){ %>
+    <%- partial('_partial/sidebar') %>
+  <% } %>
+  <div class="outer">
+    <div class="float-right">
+      <%- partial('post/busuanzi') %>
+    </div>
+    <ul class="list-inline">
+      <li>&copy; <%= date(new Date(), 'YYYY') %> <%= config.title %></li>
+      <li><%= __('Powered by') %> <a href="http://hexo.io/" target="_blank">Hexo</a></li>
+      <li><a href="http://www.beian.miit.gov.cn" target="_blank">沪ICP备17029714号-1</a></li>
+    </ul>
+  </div>
+</footer>
