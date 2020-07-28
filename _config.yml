@@ -97,9 +97,17 @@ theme: technology
 
 # Deployment
 ## Docs: https://hexo.io/docs/deployment.html
+# deploy:
+#   type: git
+#   repository: git@github.com:iotctech/blog.git
+#   branch: gh-pages
+
 deploy:
-  type: git
+- type: git
   repository: git@github.com:iotctech/blog.git
+  branch: gh-pages
+- type: git
+  repository: git@gitee.com:loyasto/blog.git
   branch: gh-pages
 
 # Hexo-generator-search
