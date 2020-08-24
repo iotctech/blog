@@ -1,0 +1,2445 @@
+<?xml version="1.0" encoding="utf-8"?>
+<search>
+  <entry>
+    <title>GPU集合训练性能优化</title>
+    <url>/blog/2020/07/23/GPU%E9%9B%86%E5%90%88%E8%AE%AD%E7%BB%83%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/</url>
+    <content><![CDATA[<p>分布式训练模式主要包括<strong>参数服务器异步训练、参数服务器同步训练、集合训练（同步模式）、模型并行同步训练</strong>四种，常用的模式有参数服务器异步训练和集合训练两种，特点如下：</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>参数服务器异步训练</td>
+<td>计算和通信在时间上分散，通信等待时间少<br> 各worker独立训练，减少同步阻塞时间<br> 训练吞吐量大，训练速度快<br> worker间松耦合，容错性好</td>
+<td>参数梯度失效<br> 无锁更新，临界区数据会引入参数脏数据<br> 难以确定S/C的比例</td>
+</tr>
+<tr>
+<td>集合训练</td>
+<td>P2P模式，简单易于扩展<br> 参数梯度本地更新，通信带宽占用少</td>
+<td>木桶效应，负载不均造成训练阻塞<br> 大Batch影响收敛<br> 工作组强耦合，容错性差</td>
+</tr>
+</tbody></table>
+<p>针对集合训练GPU性能优化方法如下：</p>
+<h3 id="1、常规优化"><a href="#1、常规优化" class="headerlink" title="1、常规优化"></a>1、常规优化</h3><h4 id="1-1、梯度融合和多流通信"><a href="#1-1、梯度融合和多流通信" class="headerlink" title="1.1、梯度融合和多流通信"></a>1.1、梯度融合和多流通信</h4><p>分布式性能的关键是如何优化通信环节的效率。训练梯度的产生时机依赖于它们各自在计算图中的位置，计算图中存在依赖关系的部分梯度决定了这一部分梯度被计算出来的先后顺序。在梯度同步的过程中，面临的一个优化问题是，我们是要收集到任意数量的梯度之后立刻对所有的梯度进行通信，还是选择某个更优化的组合方式来通信。</p>
+<p>这里一个确定性结论是，对单个梯度进行单次通信，通信效率总是非常低下的，我们需要进行多个梯度的融合，然后再对融合后的更大粒度上进行通信，确保每次通信粒度尽量均匀，减小出现大幅波动的可能。</p>
+<p>从通信库而言，单一的通信流效率比较低，多流通信会分配多个通信流进行梯度通信，每个流服务于切分出来的某个融合梯度，而后续切分的融合粒度并不依赖于当前切分的融合梯度。</p>
+<h4 id="1-2、图依赖分析"><a href="#1-2、图依赖分析" class="headerlink" title="1.2、图依赖分析"></a>1.2、图依赖分析</h4><p><img src="1.png" alt></p>
+<p><img src="2.png" alt></p>
+<p>如图所示，如果正常分层训练，顺序执行SYNC_op时间会形成GAP，影响训练效率，可以将op3算子放到op2运算之后，这样可以消除GAP，达到提升效率的目的。</p>
+<h4 id="1-3、层次通信"><a href="#1-3、层次通信" class="headerlink" title="1.3、层次通信"></a>1.3、层次通信</h4><p>常规参数同步需要不同卡依次同步，由于机器内NVLink带宽（300GB）远大于机器间网卡带宽（10GB），可以选择参数优先在单台机器内部完成同步，然后再进行机器间的参数同步，最好再将同步信息在机器内进行多卡广播，同步到各个卡上。这样可以缩短点对点的路径，充分利用NVLink高带宽的特点，加速训练。</p>
+<h4 id="1-4、OP融合"><a href="#1-4、OP融合" class="headerlink" title="1.4、OP融合"></a>1.4、OP融合</h4><p>单射OP融合，解决访存受限问题</p>
+<h3 id="2、自动混合精度（AMP）训练"><a href="#2、自动混合精度（AMP）训练" class="headerlink" title="2、自动混合精度（AMP）训练"></a>2、自动混合精度（AMP）训练</h3><p>针对精度敏感的信息使用FP32精度，其他使用FP16精度，混合双精度运算可以减少内存开销，加快训练速度。</p>
+<p>具体实现，设置黑白灰名单，黑名单存储精度敏感op，如softmax，exp等；白名单是可以使用FP16的op，高加速比op；灰名单是根据前序op决定自己精度的op。</p>
+<ul>
+<li>前向/反向/通信：FP16</li>
+<li>参数更新（精度敏感）：FP32</li>
+</ul>
+<p>在参数更新之前使用FP16数据进行参数同步。<br>Resnet50测试 AMP有效加速2.8倍</p>
+<h3 id="3、显存有限的大Batch训练组件"><a href="#3、显存有限的大Batch训练组件" class="headerlink" title="3、显存有限的大Batch训练组件"></a>3、显存有限的大Batch训练组件</h3><p><strong>Forward Recompute Backpropagation：GPU显存资源较少的情况下，无损对齐算法配置的推荐方式</strong></p>
+<p>针对显存有限，但Batch Size比较大的训练组件，采用重计算反向网络方案进行优化。</p>
+<p>深度学习训练过程中，在前向网络每个算子只对前一算子数据有依赖关系，对没有依赖关系的算子使用后直接释放显存。但是在反向网络中，依赖的算子资源比较多，占用的显存会急速上涨，如果batch size比较大的话，显存峰峰值会限制组件性能。然而真正GPU的使用率却没有达到最优。</p>
+<p>针对上述问题，可以在方向网络中将初始算子参数进行保存，释放该算子下级依赖算子的参数，等到方向网络需要依赖算子的参数时，使用保存的算子参数，依次重新参与一遍运算，求出依赖算子的参数。</p>
+<ul>
+<li>32G V100 &amp; FP32，在多个不同模型下进行最大batch size测试，提升高达600%+</li>
+<li>加入Forward Recompute模型运行的吞吐量会损失15%-35%，但在分布式情况下，吞吐量下降为0%-17%</li>
+</ul>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>分布式训练</tag>
+        <tag>集合训练</tag>
+        <tag>GPU</tag>
+        <tag>性能优化</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>TCN-时间卷积网络</title>
+    <url>/blog/2020/06/12/TCN-%E6%97%B6%E9%97%B4%E5%8D%B7%E7%A7%AF%E7%BD%91%E7%BB%9C/</url>
+    <content><![CDATA[<h3 id="1、引言"><a href="#1、引言" class="headerlink" title="1、引言"></a>1、引言</h3><p>时序问题的建模大家一般习惯性的采用循环神经网络（RNN）来建模，这是因为RNN天生的循环自回归的结构是对时间序列的很好的表示。传统的卷积神经网络一般认为不太适合时序问题的建模，这主要由于其卷积核大小的限制，不能很好的抓取长时的依赖信息。 但是最近也有很多的工作显示，特定的卷积神经网络结构也可以达到很好的效果，比如Goolgle提出的用来做语音合成的wavenet，Facebook提出的用来做翻译的卷积神经网络。这就带来一个问题，用卷积来做神经网络到底是只适用于特定的领域还是一种普适的模型？ 本文就带着这个问题，将一种特殊的卷积神经网络——时序卷积网络（Temporal convolutional network， TCN）与多种RNN结构相对比，发现在多种任务上TCN都能达到甚至超过RNN模型。</p>
+<h3 id="2、时序卷积神经网络"><a href="#2、时序卷积神经网络" class="headerlink" title="2、时序卷积神经网络"></a>2、时序卷积神经网络</h3><h4 id="2-1、因果卷积（Causal-Convolution）"><a href="#2-1、因果卷积（Causal-Convolution）" class="headerlink" title="2.1、因果卷积（Causal Convolution）"></a>2.1、因果卷积（Causal Convolution）</h4><p><img src="1.jpeg" alt></p>
+<p>因果卷积可以用上图直观表示。 即对于上一层t时刻的值，只依赖于下一层t时刻及其之前的值。和传统的卷积神经网络的不同之处在于，因果卷积不能看到未来的数据，它是单向的结构，不是双向的。也就是说只有有了前面的因才有后面的果，是一种严格的时间约束模型，因此被成为因果卷积。</p>
+<h4 id="2-2、膨胀卷积（Dilated-Convolution）"><a href="#2-2、膨胀卷积（Dilated-Convolution）" class="headerlink" title="2.2、膨胀卷积（Dilated Convolution）"></a>2.2、膨胀卷积（Dilated Convolution）</h4><p>单纯的因果卷积还是存在传统卷积神经网络的问题，即对时间的建模长度受限于卷积核大小的，如果要想抓去更长的依赖关系，就需要线性的堆叠很多的层。为了解决这个问题，研究人员提出了膨胀卷积。如下图所示:</p>
+<p><img src="2.jpeg" alt></p>
+<h4 id="2-3、残差链接（Residual-Connections）"><a href="#2-3、残差链接（Residual-Connections）" class="headerlink" title="2.3、残差链接（Residual Connections）"></a>2.3、残差链接（Residual Connections）</h4><p><img src="3.jpeg" alt></p>
+<p>残差链接被证明是训练深层网络的有效方法，它使得网络可以以跨层的方式传递信息。本文构建了一个残差块来代替一层的卷积。如上图所示，一个残差块包含两层的卷积和非线性映射，在每层中还加入了WeightNorm和Dropout来正则化网络。</p>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>网络模型</tag>
+        <tag>TCN</tag>
+        <tag>时间卷积</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>YOWO-论文翻译</title>
+    <url>/blog/2020/06/18/YOWO-%E8%AE%BA%E6%96%87%E7%BF%BB%E8%AF%91/</url>
+    <content><![CDATA[<h3 id="You-Only-Watch-Once-A-Unified-CNN-Architecture-for-Real-Time-Spatiotemporal-Action-Localization"><a href="#You-Only-Watch-Once-A-Unified-CNN-Architecture-for-Real-Time-Spatiotemporal-Action-Localization" class="headerlink" title="You Only Watch Once: A Unified CNN Architecture for Real-Time Spatiotemporal Action Localization"></a>You Only Watch Once: A Unified CNN Architecture for Real-Time Spatiotemporal Action Localization</h3><p><a href="https://arxiv.org/pdf/1911.06644.pdf" target="_blank" rel="noopener">论文地址</a><br><a href="https://github.com/wei-tim/YOWO" target="_blank" rel="noopener">源码地址</a></p>
+<h3 id="摘要"><a href="#摘要" class="headerlink" title="摘要"></a>摘要</h3><p>时空动作定位要求将两个信息源整合到设计的体系结构中：（1）来自前一帧的时间信息；（2）来自关键帧的空间信息。目前最先进的方法通常是通过单独的网络提取这些信息，并使用一种额外的融合机制来获取检测结果。在这项工作中，我们提出了一个统一的CNN架构YOWO，用于视频流中的实时时空动作定位。YOWO是一个具有两个分支的单阶段体系结构，可以在一次评估中同时提取时间和空间信息，并直接从视频剪辑中预测边界框和动作概率【个人理解就是行人检测+行为识别】。因为整个体系结构是统一的，所以可以端到端地进行优化。YOWO架构非常快，能实现16帧输入剪辑达到每秒34帧和8帧输入剪辑达到每秒62帧的速度，这是当前时空动作本地化任务上最快的最新架构 。值得注意的是，YOWO优于J-HMDB-21和UCF101-24上的最新技术成果，分别显着提高了约3％和约12％。我们使我们的代码和预先训练的模型公开可用。</p>
+<h3 id="1、引言"><a href="#1、引言" class="headerlink" title="1、引言"></a>1、引言</h3><p>人类行为的时空定位是近年来备受关注的研究课题，其目的不仅是识别行为的发生，而且是对行为在时间和空间上的定位。在这类任务中，与静态图像中的目标检测相比，时间信息起着至关重要的作用。寻找一种有效的策略来聚集空间和时间特征使得这个问题更加具有挑战性。另一方面，实时人体动作检测在众多视觉应用中变得越来越重要，如人机交互(HCI)系统、无人机(UAV)监控、自主驾驶、城市安全系统等。因此，探索一个更有效的框架来解决这个问题是可取的，也是值得的。受卓越的目标检测架构Faster R-CNN[27]的启发，最先进的工作[13,24]将经典的两阶段网络结构扩展到动作检测，在第一阶段产生大量proposals，然后在第二阶段进行分类和定位细化。然而，这两阶段的pipelines在时空动作定位任务中有三个主要的缺点。首先，由跨帧边界框组成的动作管( action tubes)的生成要比二维情况复杂得多，而且耗时。其次，动作建议(action proposals)只关注视频中的人的特征，忽略了人与背景中某些属性之间的关系，而这些关系能够为动作预测提供相当关键的上下文信息。两阶段体系结构的第三个问题是，单独训练区域建议网络和分类网络并不能保证找到全局最优解。相反，只能从两个阶段的组合中找到局部最优。训练成本也比单级网络高，因此需要更长的时间和更多的内存。</p>
+<p>在本文中，我们提出了一个新颖的单级框架YOWO (You Only Watch Once)，用于视频中的时空动作定位。YOWO使用单阶段架构避免了上面提到的所有三个缺点。YOWO的直观思想源于人类的视觉认知系统。例如，当我们沉迷于电视前的一部肥皂剧时，每次我们的眼睛都捕捉到一个画面。为了了解每个艺术家正在执行的动作，我们必须将当前帧信息（关键帧中的二维特征）与从存储在内存中的先前帧中获得的知识（片段中的三维特征）关联起来。然后将这两种特征融合在一起，为我们提供一个合理的结论。图1展示了我们的灵感。</p>
+<p><img src="1.png" alt></p>
+<p>YOWO架构是一个具有两个分支的单阶段网络。一个分支通过2D-CNN提取关键帧（即当前帧）的空间特征，而另一个分支则通过3D-CNN建模由先前帧组成的剪辑的时空特征。 为了平稳地汇总这些特征，使用了一种通道融合和关注机制，在这种情况下，我们最大程度地利用了通道间的依赖性。最后，利用融合后的特征进行帧级检测，并给出一种生成动作管(action tubes)的连接算法。最后，利用融合后的特征进行帧级检测，并给出一种生成动作管的连接算法【应该就是行为预测】。</p>
+<p>为了保持实时能力，我们在RGB模式下运行了YOWO。但是，必须指出的是，YOWO体系结构并不局限于仅在RGB模式下运行。在YOWO中可以插入不同的分支以适应不同的模式，如光流、深度等。此外，在其2D-CNN和3D-CNN分支中，任何CNN架构都可以根据所需的运行时性能来使用，这对于实际应用程序非常关键。</p>
+<p>本文的贡献总结如下:</p>
+<ul>
+<li><p>1.我们提出了一种实时单阶段的视频流时空动作定位框架YOWO，该框架可以端到端的高效训练。据我们所知，这是第一个实现二维CNN和三维CNN同时提取特征以实现边界框回归的工作。这两种特征对于最终的边界盒回归和动作分类具有互补作用。另外，我们使用了一个通道注意机制来平滑地聚合来自上面两个分支的特性。实验证明，基于通道的特征映射机制能够较好地模拟连接后的特征映射的通道间关系，并通过更合理地融合特征显著地提高了映射的性能。</p>
+</li>
+<li><p>2.我们对YOWO结构进行了详细的消融(ablation study)研究。我们研究了3D-CNN、2D-CNN的效果，它们的聚集性和融合机制。此外，我们尝试了不同的3D-CNN架构和不同的剪辑长度，以探索精度和速度之间的进一步平衡。</p>
+</li>
+<li><p>3.我们以J-HMDB-21和UCF101-24基准评估YOWO，并建立新的最新结果，分别在帧mAP方面分别提高3.3％和12.2％。</p>
+</li>
+</ul>
+<h3 id="2-相关工作"><a href="#2-相关工作" class="headerlink" title="2. 相关工作"></a>2. 相关工作</h3><p>行为识别与深度学习。由于深度学习给图像识别带来了重大的技术进步，近年来大量的研究工作致力于将其扩展到视频中的动作识别中。然而，对于动作识别，除了从每个单独的图像中提取空间特征外，还需要考虑跨这些帧的时间上下文。双流CNN是一种分离提取空间和时间特征并将其聚合在一起的有效策略 [6] [30] [36]。这些工作大部分是基于光流，需要大量的计算能力来提取，这是一个耗时的过程。随着时间的推移，另一种集成CNN特性的选择是实现递归网络，但其性能不如最近基于CNN的方法[42]那么令人满意。近年来，三维cnn在视频分析任务中的应用越来越广泛，它可以同时从空间和时间两个维度学习特征。首先利用3D-CNN来提取[16]中的时空特征，并探讨了一些有效的网络结构，如C3D[34]和I3D[2]。灵感来自于2D-CNN残差网络[40]，跨层跳转连接也适用于3D-CNNs解决了[12]梯度消失问题。为了提高资源效率，其他一些研究工作侧重于使用2D- cnn从单个图像中学习2D特征，然后将它们融合在一起，使用3D-CNN[44]学习时间特征。【总结一下，使用3DCNN，使用残差网络有效】</p>
+<p>时空行为定位。对于图像中的目标检测，R-CNN系列在第一阶段使用选择性搜索[10]或RPN[27]提取区域建议，在第二阶段对这些潜在区域的对象进行分类。虽然Faster R-CNN[27]在对象检测方面取得了最先进的结果，但由于其耗时的两阶段结构，在实时任务中很难实现。YOLO[25]和SSD[23]旨在将这一过程简化为一个阶段，并具有出色的实时性能。对于视频中的动作定位，由于R-CNN系列的成功，大多数的研究方法都是先在每一帧中检测人类，然后将这些边界框合理地连接成动作管道( action tubes)[11,13,24]。双流检测器在原有的分类器的基础上引入了一个额外的流，用于光学流模态[24][29][32]。其他一些工作产生具有3D-CNN的候选夹管（ clip tube），并在相应的3D特征上实现回归和分类[13] [29]，因此候选区域对于它们是必要的。在最近的[4]工作中，作者提出了一种用于视频动作检测的三维胶囊网络，它可以联合执行像素级的动作分割和动作分类。但是，由于它是一个基于U-Net[28]的3D-CNN架构，因此在计算复杂度和参数数量上都非常巨大。<br>注意力模块。注意力是捕获远距离依赖项的有效机制，在图像分类[35][3][39]和场景分割[7]中，注意力被尝试用于CNNs中，以提高图像分类[35][3][39]和场景分割[7]的性能。</p>
+<h3 id="3-方法"><a href="#3-方法" class="headerlink" title="3. 方法"></a>3. 方法</h3><p>在本节中，我们首先详细介绍YOWO的体系结构，它从关键帧中提取二维特征，同时从输入片段中提取三维特征，并将它们聚合在一起。随后讨论了通道融合和注意机制的实现，这提供了必不可少的性能提升。最后，我们描述了YOWO架构的训练过程和改进的边界框连接策略，以生成未剪辑视频中的动作管（action tubes）。</p>
+<h4 id="3-1-YOWO框架"><a href="#3-1-YOWO框架" class="headerlink" title="3.1 YOWO框架"></a>3.1 YOWO框架</h4><p>YOWO架构如图2所示，它可以分为四个主要部分:3D-CNN分支、2D-CNN分支、CFAM和边界框回归部分。</p>
+<p><img src="2.png" alt></p>
+<p>图2.YOWO框架。输入剪辑和相应的关键帧被馈送到3D-CNN和2D-CNN以产生分别为[C′′<br>×H′×W′]和[C′×H′×W′]的输出特征体积。这些输出量被输入到通道融合和注意机制(CFAM)以实现平滑的特征聚合。最后一个conv层用于调整最终边界框预测的通道号。</p>
+<p><strong>3D-CNN分支</strong></p>
+<p>由于上下文信息对人类行为理解至关重要，因此我们利用3D-CNN来提取时空特征。三维神经网络不仅可以在空间维度上进行卷积运算，而且可以在时间维度上进行卷积运算来获取运动信息。我们框架中的基本3D-CNN架构是3D-ResNext-101，因为它在Kinetics数据集中具有很高的性能[12]。除了3D-ResNext-101，我们还在消融研究中尝试了不同的3D-CNN模型。对于所有3D-CNN架构，最后一个conv层之后的所有层都将被丢弃。3D网络的输入是视频片段，该视频片段按时间顺序由一系列连续的帧组成，形状为[C×D×H×W][C×D×H×W][C×D×H×W]，而3D ResNext-的最后一个conv层 101输出形状为[C′×D′×H′×W′]的特征图。其中C=3, D为输入帧数，H和W为输入图像的高度和宽度，C’为输出通道数， D′=1, H′=H/32。为了匹配2D-CNN的输出特征图，将输出特征图的深度维数减少到1，将输出体积压缩到[C′×H′×W′]。</p>
+<p><strong>2D-CNN分支</strong></p>
+<p>同时，为了解决空间定位问题，并行提取关键帧的二维特征。我们在2D CNN分支中采用Darknet-19 [26]作为基本架构，因为它在准确性和效率之间取得了很好的平衡。形状为[C×H×W]的关键帧是输入剪辑的最新帧，因此不需要额外的数据加载器。Darknet-19的输出特征图的形状为[C’’×H′×W′]，其中C=3,C’’是输出通道的数量，H′=H/32和W′=W/32W, 和3D-CNN的案例一致。</p>
+<p>YOWO的另一个重要特点是二维CNN和三维CNN分支的架构可以被任意的CNN架构所替代，这使得它更加灵活。【暗示可以定制化】YOWO被设计为简单和省力的切换模式。必须注意的是，虽然YOWO有两个分支，但它是一个统一的体系结构，可以端到端的进行训练。</p>
+<p><strong>特征聚合:通道融合与注意机制(CFAM)</strong><br>我们使三维和二维网络的输出在最后两个维度上具有相同的形状，使得这两个特征映射可以很容易地融合在一起。我们使用简单地沿着通道堆叠特性的连接来融合两个特性图。因此，融合的特征映射编码了运动和外观信息，我们将这些信息作为输入传递给CFAM模块，该模块基于Gram（格拉姆）矩阵来映射通道间的依赖关系。虽然基于Gram矩阵的注意机制最初被用于风格转移[8]，最近又被用于分割任务[7]，但这种注意机制有利于合理融合来自不同来源的特征，显著提高了整体性能。</p>
+<p><img src="3.png" alt></p>
+<p>图3.2D-CNN和3D-CNN分支输出特征图的通道融合与注意机制</p>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>YOWO</tag>
+        <tag>行为识别</tag>
+        <tag>视频理解</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>aarch64-write-syscall</title>
+    <url>/blog/2020/06/14/aarch64%E6%9E%B6%E6%9E%84write%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8/</url>
+    <content><![CDATA[<ul>
+<li>参考文章<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">https:&#x2F;&#x2F;blog.csdn.net&#x2F;yusakul&#x2F;article&#x2F;details&#x2F;105706674</span><br><span class="line">https:&#x2F;&#x2F;blog.csdn.net&#x2F;weixin_42523774&#x2F;article&#x2F;details&#x2F;103341058（glibc）</span><br><span class="line">https:&#x2F;&#x2F;blog.csdn.net&#x2F;yhb1047818384&#x2F;article&#x2F;details&#x2F;51842607（寄存器）</span><br><span class="line">https:&#x2F;&#x2F;www.cnblogs.com&#x2F;nufangrensheng&#x2F;p&#x2F;3890856.html（::memory）</span><br><span class="line">https:&#x2F;&#x2F;baijiahao.baidu.com&#x2F;s?id&#x3D;1604601045858159778&amp;wfr&#x3D;spider&amp;for&#x3D;pc（系统调用实现文件）</span><br></pre></td></tr></table></figure>
+
+</li>
+</ul>
+<h3 id="1、write流程"><a href="#1、write流程" class="headerlink" title="1、write流程"></a>1、write流程</h3><p>1、user调用write系统调用</p>
+<p>2、glibc中转换为系统调用号，将系统调用号保存在x8寄存器中，同时保存返回地址在x0，接着触发svc异常</p>
+<p>3、从EL0切换到EL1，进入内核通过aarch64的中断向量表，找到异常向量入口el0_sync（arch/arm64/kernel/entry.S）</p>
+<p>4、el0_sync函数中判断异常类型是svc触发的异常</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">lsr x24, x25, #ESR_ELx_EC_SHIFT &#x2F;&#x2F; exception class</span><br></pre></td></tr></table></figure>
+
+<p>5、接着进入el0_svc</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">b.eq    el0_svc</span><br></pre></td></tr></table></figure>
+
+<p>6、加载异常系统调用表</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">adrp    stbl, sys_call_table        &#x2F;&#x2F; load syscall table pointer</span><br><span class="line">uxtw    scno, w8            &#x2F;&#x2F; syscall number in w8，从x8寄存起低32位中找打系统调用号</span><br><span class="line">ldr x16, [stbl, scno, lsl #3]   &#x2F;&#x2F; address in the syscall table</span><br><span class="line">blr x16             &#x2F;&#x2F; call sys_* routine</span><br><span class="line">b   ret_fast_syscall		&#x2F;&#x2F; 系统调用返回</span><br></pre></td></tr></table></figure>
+
+<p>7、第六步找通过系统调用号，在系统调用表中找到write的系统调用的位置</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">include&#x2F;uapi&#x2F;asm-generic&#x2F;unistd.h	</span><br><span class="line">    &#x2F;* fs&#x2F;read_write.c *&#x2F;</span><br><span class="line">    #define __NR_write 64</span><br><span class="line"></span><br><span class="line">fs&#x2F;read_write.c</span><br><span class="line">	SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,size_t, count)</span><br></pre></td></tr></table></figure>
+
+<p>8、写入操作</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">577 SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,</span><br><span class="line">578         size_t, count)</span><br><span class="line">579 &#123;</span><br><span class="line">580     struct fd f &#x3D; fdget_pos(fd);</span><br><span class="line">581     ssize_t ret &#x3D; -EBADF;</span><br><span class="line">582 </span><br><span class="line">583     if (f.file) &#123;</span><br><span class="line">584         loff_t pos &#x3D; file_pos_read(f.file);</span><br><span class="line">585         ret &#x3D; vfs_write(f.file, buf, count, &amp;pos);</span><br><span class="line">586         if (ret &gt;&#x3D; 0)</span><br><span class="line">587             file_pos_write(f.file, pos);</span><br><span class="line">588         fdput_pos(f);		&#x2F;&#x2F; 写入</span><br><span class="line">589     &#125;</span><br><span class="line">590 </span><br><span class="line">591     return ret;</span><br><span class="line">592 &#125;</span><br></pre></td></tr></table></figure>
+
+
+
+<h3 id="2、系统调用表"><a href="#2、系统调用表" class="headerlink" title="2、系统调用表"></a>2、系统调用表</h3><figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">arch&#x2F;arm64&#x2F;kernel&#x2F;sys.c</span><br><span class="line">    void * const sys_call_table[__NR_syscalls] __aligned(4096) &#x3D; &#123;</span><br><span class="line">    	[0 ... __NR_syscalls - 1] &#x3D; sys_ni_syscall,	&#x2F;&#x2F; 没有实现的系统调用会跳转到这里，内部直接返回</span><br><span class="line">    #include &lt;asm&#x2F;unistd.h&gt;	 &#x2F;&#x2F; arch&#x2F;arm64&#x2F;include&#x2F;asm&#x2F;unistd.h</span><br><span class="line">    &#125;;</span><br><span class="line"></span><br><span class="line">arch&#x2F;arm64&#x2F;include&#x2F;asm&#x2F;unistd.h:56</span><br><span class="line">	#define NR_syscalls (__NR_syscalls)</span><br><span class="line">	</span><br><span class="line">arch&#x2F;arm64&#x2F;include&#x2F;uapi&#x2F;asm&#x2F;unistd.h</span><br><span class="line">	#include &lt;asm-generic&#x2F;unistd.h&gt;</span><br><span class="line"></span><br><span class="line">include&#x2F;asm-generic&#x2F;unistd.h</span><br><span class="line">	#include &lt;uapi&#x2F;asm-generic&#x2F;unistd.h&gt;</span><br><span class="line">	</span><br><span class="line">include&#x2F;uapi&#x2F;asm-generic&#x2F;unistd.h	</span><br><span class="line">	该文件中说明了系统调用的实现的文件</span><br><span class="line">		write系统调用在fs&#x2F;read_write.c  &#x2F;&#x2F;SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,size_t, count)</span><br><span class="line">		getpid在kernel&#x2F;sys.c &#x2F;&#x2F; SYSCALL_DEFINE0(getpid)</span><br><span class="line">	#define __NR_syscalls 285  &#x2F;&#x2F; 当前系统有285个系统调用</span><br><span class="line">	</span><br><span class="line">include&#x2F;linux&#x2F;syscalls.h</span><br><span class="line">	对系统调用申明</span><br></pre></td></tr></table></figure>
+
+<h3 id="3、系统调用write的原子性讨论"><a href="#3、系统调用write的原子性讨论" class="headerlink" title="3、系统调用write的原子性讨论"></a>3、系统调用write的原子性讨论</h3><p><a href="https://blog.csdn.net/dog250/article/details/78879600" target="_blank" rel="noopener">https://blog.csdn.net/dog250/article/details/78879600</a></p>
+<p>append模式通过锁主inode来保证原子，write系统调用本身并步保证原子</p>
+]]></content>
+      <categories>
+        <category>linux</category>
+      </categories>
+      <tags>
+        <tag>aarch64</tag>
+        <tag>write</tag>
+        <tag>系统调用</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>softmax详解</title>
+    <url>/blog/2020/06/24/softmax%E8%AF%A6%E8%A7%A3/</url>
+    <content><![CDATA[<h3 id="1、softmax介绍"><a href="#1、softmax介绍" class="headerlink" title="1、softmax介绍"></a>1、softmax介绍</h3><p>在机器学习尤其是深度学习中，softmax是个非常常用而且比较重要的函数，尤其在多分类的场景中使用广泛。他把一些输入映射为0-1之间的实数，并且归一化保证和为1，因此多分类的概率之和也刚好为1。</p>
+<p><img src="1.png" alt></p>
+<h3 id="2、softmax定义"><a href="#2、softmax定义" class="headerlink" title="2、softmax定义"></a>2、softmax定义</h3><p>维基上的解释和公式是：<br><img src="4.png" alt></p>
+<p><img src="2.png" alt></p>
+<p><img src="3.png" alt></p>
+<p>后面一层作为预测分类的输出节点，每一个节点就代表一个分类，任何一个节点的激励函数都是：</p>
+<p><img src="5.png" alt></p>
+<p>其中i就是节点的下标次序，而zi = wi + bi, 也就说这是一个线性分类器的输出作为自然常数e的指数。最有趣的是最后一层有这样的特性：</p>
+<p><img src="6.png" alt></p>
+<p>也就是说最后一层的每个节点的输出值的加和是1。这种激励函数从物理意义上可以解释为一个样本通过网络进行分类的时候在每个节点上输出的值都是小于等于1的，是它从属于这个分类的概率。</p>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>softmax</tag>
+        <tag>输出层</tag>
+        <tag>激励函数</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>一棵开花的树</title>
+    <url>/blog/2020/06/24/%E4%B8%80%E6%A3%B5%E5%BC%80%E8%8A%B1%E7%9A%84%E6%A0%91/</url>
+    <content><![CDATA[<p>如何让你遇见我<br>在我最美丽的时刻</p>
+<p>为这<br>我已在佛前求了五百年<br>求佛让我们结一段尘缘<br>佛於是把我化做一棵树<br>长在你必经的路旁</p>
+<p>阳光下<br>慎重地开满了花<br>朵朵都是我前世的盼望</p>
+<p>当你走近<br>请你细听<br>那颤抖的叶<br>是我等待的热情</p>
+<p>而当你终於无视地走过<br>在你身後落了一地的<br>朋友啊<br>那不是花瓣<br>那是我凋零的心</p>
+]]></content>
+      <categories>
+        <category>lifestyle</category>
+      </categories>
+      <tags>
+        <tag>席慕容</tag>
+        <tag>现代</tag>
+        <tag>诗词</tag>
+        <tag>才女</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>二叉堆详解</title>
+    <url>/blog/2020/07/23/%E4%BA%8C%E5%8F%89%E5%A0%86%E8%AF%A6%E8%A7%A3/</url>
+    <content><![CDATA[<h3 id="1、什么是二叉堆"><a href="#1、什么是二叉堆" class="headerlink" title="1、什么是二叉堆"></a>1、什么是二叉堆</h3><p>二叉堆本质是一种完全二叉树，分为<strong>最大堆</strong>和<strong>最小堆</strong>。</p>
+<p>最大堆是指任何一个父节点的值都大于等于它孩子节点的值；最小堆是指任何父节点的值都小于等于他左右孩子节点的值。</p>
+<p><img src="1.png" alt></p>
+<p>二叉堆的根节点叫做堆顶。最大堆和最小堆的特点，决定了在最大堆的堆顶是整个堆中的最大元素；最小堆的堆顶是整个堆中的最小元素。</p>
+<p>二叉堆通常用数组来表示。如果根节点在数组中的位置是1，第n个位置的子节点分别在2n和 2n+1。因此，第1个位置的子节点在2和3，第2个位置的子节点在4和5。以此类推。这种基于1的数组存储方式便于寻找父节点和子节点。</p>
+<p>对于一个很大的堆，这种存储是低效的。因为节点的子节点很可能在另外一个内存页中。B-heap是一种效率更高的存储方式，把每个子树放到同一内存页。</p>
+<p>如果用指针链表存储堆，那么需要能访问叶节点的方法。可以对二叉树“穿线”(threading)方式，来依序遍历这些节点。</p>
+<p>二叉堆的主要操作有sink （下沉）和 swim （上浮），⽤以维护⼆叉堆的性质。</p>
+<p>二叉堆的主要应⽤，⾸先是⼀种排序⽅法<strong>堆排序</strong>，第⼆是⼀种很有⽤的数据结构<strong>优先级队列</strong>。</p>
+<h3 id="2、二叉堆的索引"><a href="#2、二叉堆的索引" class="headerlink" title="2、二叉堆的索引"></a>2、二叉堆的索引</h3><p>因为，⼆叉堆其实就是⼀种特殊的⼆叉树（完全⼆叉树），只不过存储在数组⾥。⼀般的链表⼆叉树，我们操作节点的指针，⽽在数组⾥，我们把数组索引作为指针：</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">&#x2F;&#x2F; ⽗节点的索引</span><br><span class="line">int parent(int root) </span><br><span class="line">&#123;</span><br><span class="line">    return root &#x2F; 2;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line">&#x2F;&#x2F; 左孩⼦的索引</span><br><span class="line">int left(int root) </span><br><span class="line">&#123;</span><br><span class="line">    return root * 2;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line">&#x2F;&#x2F; 右孩⼦的索引</span><br><span class="line">int right(int root) </span><br><span class="line">&#123;</span><br><span class="line">    return root * 2 + 1;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>画个图就能理解了，注意数组的第⼀个索引 0 空着不⽤</p>
+<p><img src="2.png" alt></p>
+<p>把 arr[1] 作为整棵树的根的话，每个节点的⽗节点和左右孩⼦的索引都可以通过简单的运算得到，这就是⼆叉堆设计的⼀个巧妙之处。</p>
+<p>另外，对于⼀个最⼤堆，根据其性质，显然堆顶，也就是 arr[1] ⼀定是所有元素中最⼤的元素。</p>
+<h3 id="3、优先级队列"><a href="#3、优先级队列" class="headerlink" title="3、优先级队列"></a>3、优先级队列</h3><h3 id="4、swim和sink实现"><a href="#4、swim和sink实现" class="headerlink" title="4、swim和sink实现"></a>4、swim和sink实现</h3><h3 id="5、delMax和insert实现"><a href="#5、delMax和insert实现" class="headerlink" title="5、delMax和insert实现"></a>5、delMax和insert实现</h3>]]></content>
+      <categories>
+        <category>linux</category>
+      </categories>
+      <tags>
+        <tag>数据结构</tag>
+        <tag>二叉堆</tag>
+        <tag>算法</tag>
+        <tag>LeetCode</tag>
+        <tag>二叉树</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>你是人间的四月天</title>
+    <url>/blog/2020/06/24/%E4%BD%A0%E6%98%AF%E4%BA%BA%E9%97%B4%E7%9A%84%E5%9B%9B%E6%9C%88%E5%A4%A9/</url>
+    <content><![CDATA[<p><img src="1.jpeg" alt></p>
+<p>我说 你是人间的四月天；</p>
+<p>笑响点亮了四面风；</p>
+<p>轻灵在春的光艳中交舞着变。</p>
+<p>你是四月早天里的云烟，</p>
+<p>黄昏吹着风的软，</p>
+<p>星子在无意中闪，</p>
+<p>细雨点洒在花前。</p>
+<p>那轻，那娉婷，你是，</p>
+<p>鲜妍百花的冠冕你戴着，</p>
+<p>你是天真，庄严，</p>
+<p>你是夜夜的月圆。</p>
+<p>雪化后那片鹅黄，你像；</p>
+<p>新鲜初放芽的绿，你是；</p>
+<p>柔嫩喜悦，</p>
+<p>水光浮动着你梦期待中白莲。</p>
+<p>你是一树一树的花开，</p>
+<p>是燕在梁间呢喃，</p>
+<p>——你是爱，是暖，是希望，</p>
+<p>你是人间的四月天！</p>
+]]></content>
+      <categories>
+        <category>lifestyle</category>
+      </categories>
+      <tags>
+        <tag>现代</tag>
+        <tag>诗词</tag>
+        <tag>才女</tag>
+        <tag>林徽因</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>他希冀天国的锦缎</title>
+    <url>/blog/2020/06/24/%E4%BB%96%E5%B8%8C%E5%86%80%E5%A4%A9%E5%9B%BD%E7%9A%84%E9%94%A6%E7%BC%8E/</url>
+    <content><![CDATA[<p><strong>He wishes for the Cloths of Heaven</strong><br><em>by W.B.Yeats</em></p>
+<p><img src="1.jpeg" alt></p>
+<p>Had I the heavens’ embroidered cloths,<br>若我有天国的锦缎，</p>
+<p>Enwrought with golden and silver light,<br>以金银色的光线编织，</p>
+<p>The blue and the dim and the dark cloths<br>还有湛蓝的夜色与洁白的昼光</p>
+<p>of night and light and the half-light,<br>以及黎明和黄昏错综的光芒，</p>
+<p>I would spread the cloths under your feet.<br>我将用这锦缎铺展在你的脚下。</p>
+<p>But I, being poor, have only my dreams;<br>可我，如此贫穷，仅仅拥有梦；</p>
+<p>I have spread my dreams under your feet,<br>就把我的梦铺展在你的脚下，</p>
+<p>Tread softly because you tread on my dreams.<br>轻一点啊，因为你脚踩着我的梦。</p>
+]]></content>
+      <categories>
+        <category>lifestyle</category>
+      </categories>
+      <tags>
+        <tag>诗词</tag>
+        <tag>W.B.Yeats</tag>
+        <tag>叶芝</tag>
+        <tag>英文</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>各种二叉树</title>
+    <url>/blog/2020/07/23/%E5%90%84%E7%A7%8D%E4%BA%8C%E5%8F%89%E6%A0%91/</url>
+    <content><![CDATA[<h3 id="1、满二叉树"><a href="#1、满二叉树" class="headerlink" title="1、满二叉树"></a>1、满二叉树</h3><p>如果一棵二叉树的层数为K，且节点总数是<strong>(2^K)-1</strong>，则它就是满二叉树。</p>
+<p>英文定义：a binary tree T is full if each node is either a leaf or possesses exactly two childnodes.</p>
+<p>即：如果一棵二叉树的节点要么是叶子节点，要么它有两个子节点，这样的数就是满二叉树。</p>
+<p><img src="1.png" alt></p>
+<h3 id="2、完全二叉树"><a href="#2、完全二叉树" class="headerlink" title="2、完全二叉树"></a>2、完全二叉树</h3><p>若设二叉树的深度为K，除第K层外，其他各层（1~K-1）的结点数都达到最大个数，第K层所有的结点都连续集中在最左边，这就是完全二叉树。</p>
+<p><img src="2.png" alt></p>
+<h3 id="3、平衡二叉树"><a href="#3、平衡二叉树" class="headerlink" title="3、平衡二叉树"></a>3、平衡二叉树</h3><p>平衡二叉树（Balanced Binary Tree）（AVL树）：空树或者任一结点左、右子树高度差的绝对值不超过1，即|BF（T）&lt;=1|。</p>
+<p><img src="3.png" alt></p>
+<h3 id="4、最优二叉树（哈夫曼树）"><a href="#4、最优二叉树（哈夫曼树）" class="headerlink" title="4、最优二叉树（哈夫曼树）"></a>4、最优二叉树（哈夫曼树）</h3><p>树的带权路径长度达到最小，称这样的二叉树为最优二叉树，也称为哈夫曼树(Huffman Tree)。哈夫曼树是带权路径长度最短的树，权值较大的结点离根较近。</p>
+]]></content>
+      <categories>
+        <category>linux</category>
+      </categories>
+      <tags>
+        <tag>数据结构</tag>
+        <tag>算法</tag>
+        <tag>LeetCode</tag>
+        <tag>二叉树</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>各种预训练模型和源码</title>
+    <url>/blog/2020/07/28/%E5%90%84%E7%A7%8D%E9%A2%84%E8%AE%AD%E7%BB%83%E6%A8%A1%E5%9E%8B%E5%92%8C%E6%BA%90%E7%A0%81/</url>
+    <content><![CDATA[<h2 id="1、Image-Classification"><a href="#1、Image-Classification" class="headerlink" title="1、Image Classification"></a>1、Image Classification</h2><h3 id="1-1、imagenet"><a href="#1-1、imagenet" class="headerlink" title="1.1、imagenet"></a>1.1、imagenet</h3><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><b>alexnet</b><br>Framework: caffe<br>Download: <a href="https://raw.githubusercontent.com/BVLC/caffe/master/models/bvlc_alexnet/deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://dl.caffe.berkeleyvision.org/bvlc_alexnet.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="https://github.com/BVLC/caffe/tree/master/models/bvlc_alexnet" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>inception_v1</b><br>Framework: caffe<br>Download: <a href="https://raw.githubusercontent.com/BVLC/caffe/master/models/bvlc_googlenet/deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://dl.caffe.berkeleyvision.org/bvlc_googlenet.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="https://github.com/BVLC/caffe/tree/master/models/bvlc_googlenet" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg16</b><br>Framework: caffe<br>Download: <a href="https://gist.githubusercontent.com/ksimonyan/211839e770f7b538e2d8/raw/c3ba00e272d9f48594acef1f67e5fd12aff7a806/VGG_ILSVRC_16_layers_deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://data.mxnet.io/models/imagenet/test/caffe/VGG_ILSVRC_16_layers.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="https://gist.github.com/ksimonyan/211839e770f7b538e2d8/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>vgg19</b><br>Framework: caffe<br>Download: <a href="https://gist.githubusercontent.com/ksimonyan/3785162f95cd2d5fee77/raw/bb2b4fe0a9bb0669211cf3d0bc949dfdda173e9e/VGG_ILSVRC_19_layers_deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://data.mxnet.io/models/imagenet/test/caffe/VGG_ILSVRC_19_layers.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="https://gist.github.com/ksimonyan/3785162f95cd2d5fee77" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet50</b><br>Framework: caffe<br>Download: <a href="http://data.mxnet.io/models/imagenet/test/caffe/ResNet-50-deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://data.mxnet.io/models/imagenet/test/caffe/ResNet-50-model.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/test/caffe/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet101</b><br>Framework: caffe<br>Download: <a href="http://data.mxnet.io/models/imagenet/test/caffe/ResNet-101-deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://data.mxnet.io/models/imagenet/test/caffe/ResNet-101-model.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/test/caffe/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>resnet152</b><br>Framework: caffe<br>Download: <a href="http://data.mxnet.io/models/imagenet/test/caffe/ResNet-152-deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://data.mxnet.io/models/imagenet/test/caffe/ResNet-152-model.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/test/caffe/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>squeezenet</b><br>Framework: caffe<br>Download: <a href="https://raw.githubusercontent.com/DeepScale/SqueezeNet/master/SqueezeNet_v1.1/deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="https://github.com/DeepScale/SqueezeNet/raw/master/SqueezeNet_v1.1/squeezenet_v1.1.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="https://github.com/DeepScale/SqueezeNet/tree/master/SqueezeNet_v1.1" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>xception</b><br>Framework: caffe<br>Download: <a href="http://mmdnn.eastasia.cloudapp.azure.com:89/models/caffe/xception_deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://mmdnn.eastasia.cloudapp.azure.com:89/models/caffe/xception.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <br></td>
+</tr>
+<tr>
+<td><b>inception_v4</b><br>Framework: caffe<br>Download: <a href="http://mmdnn.eastasia.cloudapp.azure.com:89/models/caffe/inception-v4_deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://mmdnn.eastasia.cloudapp.azure.com:89/models/caffe/inception-v4.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <br></td>
+<td><b>alexnet</b><br>Framework: cntk<br>Download: <a href="https://www.cntk.ai/Models/CNTK_Pretrained/AlexNet_ImageNet_CNTK.model" target="_blank" rel="noopener">model</a> <br>Source: <a href="https://github.com/Microsoft/CNTK/blob/master/PretrainedModels/Image.md#alexnet" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>inception_v3</b><br>Framework: cntk<br>Download: <a href="https://www.cntk.ai/Models/CNTK_Pretrained/InceptionV3_ImageNet_CNTK.model" target="_blank" rel="noopener">model</a> <br>Source: <a href="https://github.com/Microsoft/CNTK/blob/master/PretrainedModels/Image.md#alexnet" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>resnet18</b><br>Framework: cntk<br>Download: <a href="https://www.cntk.ai/Models/CNTK_Pretrained/ResNet18_ImageNet_CNTK.model" target="_blank" rel="noopener">model</a> <br>Source: <a href="https://github.com/Microsoft/CNTK/blob/master/PretrainedModels/Image.md#alexnet" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet50</b><br>Framework: cntk<br>Download: <a href="https://www.cntk.ai/Models/CNTK_Pretrained/ResNet50_ImageNet_CNTK.model" target="_blank" rel="noopener">model</a> <br>Source: <a href="https://github.com/Microsoft/CNTK/blob/master/PretrainedModels/Image.md#alexnet" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet101</b><br>Framework: cntk<br>Download: <a href="https://www.cntk.ai/Models/CNTK_Pretrained/ResNet101_ImageNet_CNTK.model" target="_blank" rel="noopener">model</a> <br>Source: <a href="https://github.com/Microsoft/CNTK/blob/master/PretrainedModels/Image.md#alexnet" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>resnet152</b><br>Framework: cntk<br>Download: <a href="https://www.cntk.ai/Models/CNTK_Pretrained/ResNet152_ImageNet_CNTK.model" target="_blank" rel="noopener">model</a> <br>Source: <a href="https://github.com/Microsoft/CNTK/blob/master/PretrainedModels/Image.md#alexnet" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>inception_v3</b><br>Framework: coreml<br>Download: <a href="https://docs-assets.developer.apple.com/coreml/models/Inceptionv3.mlmodel" target="_blank" rel="noopener">mlmodel</a> <br>Source: <br></td>
+<td><b>vgg16</b><br>Framework: coreml<br>Download: <a href="https://docs-assets.developer.apple.com/coreml/models/VGG16.mlmodel" target="_blank" rel="noopener">mlmodel</a> <br>Source: <a href="https://developer.apple.com/machine-learning/build-run-models/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>resnet50</b><br>Framework: coreml<br>Download: <a href="https://docs-assets.developer.apple.com/coreml/models/Resnet50.mlmodel" target="_blank" rel="noopener">mlmodel</a> <br>Source: <a href="https://developer.apple.com/machine-learning/build-run-models/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>mobilenet</b><br>Framework: coreml<br>Download: <a href="https://docs-assets.developer.apple.com/coreml/models/MobileNet.mlmodel" target="_blank" rel="noopener">mlmodel</a> <br>Source: <a href="https://developer.apple.com/machine-learning/build-run-models/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>imagenet1k-inception-bn</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/inception-bn/Inception-BN-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/inception-bn/Inception-BN-0126.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>imagenet1k-resnet-18</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/resnet/18-layers/resnet-18-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/resnet/18-layers/resnet-18-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>imagenet1k-resnet-34</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/resnet/34-layers/resnet-34-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/resnet/34-layers/resnet-34-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>imagenet1k-resnet-50</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/resnet/50-layers/resnet-50-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/resnet/50-layers/resnet-50-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>imagenet1k-resnet-101</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/resnet/101-layers/resnet-101-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/resnet/101-layers/resnet-101-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>imagenet1k-resnet-152</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/resnet/152-layers/resnet-152-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/resnet/152-layers/resnet-152-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>imagenet1k-resnext-50</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/resnext/50-layers/resnext-50-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/resnext/50-layers/resnext-50-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>imagenet1k-resnext-101</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/resnext/101-layers/resnext-101-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/resnext/101-layers/resnext-101-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>imagenet1k-resnext-101-64x4d</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/resnext/101-layers/resnext-101-64x4d-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/resnext/101-layers/resnext-101-64x4d-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg19</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/vgg/vgg19-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/vgg/vgg19-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>vgg16</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/vgg/vgg16-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/vgg/vgg16-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>squeezenet_v1.0</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/squeezenet/squeezenet_v1.0-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/squeezenet/squeezenet_v1.0-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>squeezenet_v1.1</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet/squeezenet/squeezenet_v1.1-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet/squeezenet/squeezenet_v1.1-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>alexnet</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/alexnet-owt-4df8aa71.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/alexnet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>densenet121</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/densenet121-a639ec97.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/densenet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>densenet169</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/densenet169-b2777c0a.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/densenet.html" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>densenet201</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/densenet201-c1103571.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/densenet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>densenet161</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/densenet161-8d451a50.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/densenet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>inception_v3</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/inception_v3_google-1a9a5a14.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/inception.html" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>resnet18</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/resnet18-5c106cde.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/resnet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet34</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/resnet34-333f7ec4.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/resnet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet50</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/resnet50-19c8e357.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/resnet.html" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>resnet101</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/resnet101-5d3b4d8f.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/resnet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet152</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/resnet152-b121ed2d.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/resnet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>squeezenet1_0</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/squeezenet1_0-a815701f.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/squeezenet.html" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>squeezenet1_1</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/squeezenet1_1-f364aa15.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/squeezenet.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg11</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/vgg11-bbd30ac9.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/vgg.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg13</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/vgg13-c768596a.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/vgg.html" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>vgg16</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/vgg16-397923af.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/vgg.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg19</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/vgg19-dcbb9e9d.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/vgg.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg11_bn</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/vgg11_bn-6002323d.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/vgg.html" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>vgg13_bn</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/vgg13_bn-abd245e5.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/vgg.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg16_bn</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/vgg16_bn-6c64b313.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/vgg.html" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg19_bn</b><br>Framework: pytorch<br>Download: <a href="https://download.pytorch.org/models/vgg19_bn-c79401a0.pth" target="_blank" rel="noopener">pth</a> <br>Source: <a href="https://pytorch.org/docs/stable/_modules/torchvision/models/vgg.html" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>vgg16</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/vgg_16_2016_08_28.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>vgg19</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/vgg_19_2016_08_28.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>inception_v1</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/inception_v1_2016_08_28.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>inception_v1_frozen</b><br>Framework: tensorflow<br>Download: <a href="https://storage.googleapis.com/download.tensorflow.org/models/inception_v1_2016_08_28_frozen.pb.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>inception_v3</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/inception_v3_2016_08_28.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>inception_v3_frozen</b><br>Framework: tensorflow<br>Download: <a href="https://storage.googleapis.com/download.tensorflow.org/models/inception_v3_2016_08_28_frozen.pb.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>resnet_v1_50</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/resnet_v1_50_2016_08_28.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet_v1_152</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/resnet_v1_152_2016_08_28.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet_v2_50</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/resnet_v2_50_2017_04_14.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>resnet_v2_152</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/resnet_v2_152_2017_04_14.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>resnet_v2_200</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/resnet_v2_200_2017_04_14.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>mobilenet_v1_1.0</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/mobilenet_v1_1.0_224_2017_06_14.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>mobilenet_v1_1.0_frozen</b><br>Framework: tensorflow<br>Download: <a href="https://storage.googleapis.com/download.tensorflow.org/models/mobilenet_v1_1.0_224_frozen.tgz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>mobilenet_v2_1.0_224</b><br>Framework: tensorflow<br>Download: <a href="https://storage.googleapis.com/mobilenet_v2/checkpoints/mobilenet_v2_1.0_224.tgz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>inception_resnet_v2</b><br>Framework: tensorflow<br>Download: <a href="http://download.tensorflow.org/models/inception_resnet_v2_2016_08_30.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>nasnet-a_large</b><br>Framework: tensorflow<br>Download: <a href="https://storage.googleapis.com/download.tensorflow.org/models/nasnet-a_large_04_10_2017.tar.gz" target="_blank" rel="noopener">tgz</a> <br>Source: <a href="https://github.com/tensorflow/models/tree/master/research/slim#Pretrained" target="_blank" rel="noopener">Link</a><br></td>
+<td></td>
+<td></td>
+</tr>
+</tbody></table>
+<h3 id="1-2、imagenet11k"><a href="#1-2、imagenet11k" class="headerlink" title="1.2、imagenet11k"></a>1.2、imagenet11k</h3><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><b>imagenet11k-resnet-152</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet-11k/resnet-152/resnet-152-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet-11k/resnet-152/resnet-152-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>imagenet11k-place365ch-resnet-152</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet-11k-place365-ch/resnet-152-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet-11k-place365-ch/resnet-152-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>imagenet11k-place365ch-resnet-50</b><br>Framework: mxnet<br>Download: <a href="http://data.mxnet.io/models/imagenet-11k-place365-ch/resnet-50-symbol.json" target="_blank" rel="noopener">json</a> <a href="http://data.mxnet.io/models/imagenet-11k-place365-ch/resnet-50-0000.params" target="_blank" rel="noopener">params</a> <br>Source: <a href="http://data.mxnet.io/models/imagenet/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+</tbody></table>
+<h2 id="2、Object-Detection"><a href="#2、Object-Detection" class="headerlink" title="2、Object Detection"></a>2、Object Detection</h2><h3 id="2-1、Pascal-VOC"><a href="#2-1、Pascal-VOC" class="headerlink" title="2.1、Pascal VOC"></a>2.1、Pascal VOC</h3><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><b>voc-fcn8s</b><br>Framework: caffe<br>Download: <a href="https://raw.githubusercontent.com/shelhamer/fcn.berkeleyvision.org/master/voc-fcn8s/deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://dl.caffe.berkeleyvision.org/fcn8s-heavy-pascal.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="https://github.com/shelhamer/fcn.berkeleyvision.org" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>voc-fcn16s</b><br>Framework: caffe<br>Download: <a href="http://mmdnn.eastasia.cloudapp.azure.com:89/models/caffe/voc-fcn16s_deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://dl.caffe.berkeleyvision.org/fcn16s-heavy-pascal.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="https://github.com/shelhamer/fcn.berkeleyvision.org" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>voc-fcn32s</b><br>Framework: caffe<br>Download: <a href="http://mmdnn.eastasia.cloudapp.azure.com:89/models/caffe/voc-fcn32s_deploy.prototxt" target="_blank" rel="noopener">prototxt</a> <a href="http://dl.caffe.berkeleyvision.org/fcn32s-heavy-pascal.caffemodel" target="_blank" rel="noopener">caffemodel</a> <br>Source: <a href="https://github.com/shelhamer/fcn.berkeleyvision.org" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>Fast-RCNN_Pascal</b><br>Framework: cntk<br>Download: <a href="https://www.cntk.ai/Models/FRCN_Pascal/Fast-RCNN.model" target="_blank" rel="noopener">model</a> <br>Source: <a href="https://docs.microsoft.com/en-us/cognitive-toolkit/object-detection-using-fast-r-cnn#train-on-pascal-voc" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>tinyyolo</b><br>Framework: coreml<br>Download: <a href="https://s3-us-west-2.amazonaws.com/coreml-models/TinyYOLO.mlmodel" target="_blank" rel="noopener">mlmodel</a> <br>Source: <a href="https://coreml.store/tinyyolo" target="_blank" rel="noopener">Link</a><br></td>
+<td><b>yolov3</b><br>Framework: darknet<br>Download: <a href="https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg" target="_blank" rel="noopener">cfg</a> <a href="https://pjreddie.com/media/files/yolov3.weights" target="_blank" rel="noopener">weights</a> <br>Source: <a href="https://pjreddie.com/darknet/yolo/" target="_blank" rel="noopener">Link</a><br></td>
+</tr>
+<tr>
+<td><b>yolov2</b><br>Framework: darknet<br>Download: <a href="https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov2.cfg" target="_blank" rel="noopener">cfg</a> <a href="https://pjreddie.com/media/files/yolov2.weights" target="_blank" rel="noopener">weights</a> <br>Source: <a href="https://pjreddie.com/darknet/yolo/" target="_blank" rel="noopener">Link</a><br></td>
+<td></td>
+<td></td>
+</tr>
+</tbody></table>
+<h3 id="2-2、grocery100"><a href="#2-2、grocery100" class="headerlink" title="2.2、grocery100"></a>2.2、grocery100</h3><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><b>Fast-RCNN_grocery100</b><br>Framework: cntk<br>Download: <a href="https://www.cntk.ai/Models/FRCN_Grocery/Fast-RCNN_grocery100.model" target="_blank" rel="noopener">model</a> <br>Source: <a href="https://docs.microsoft.com/en-us/cognitive-toolkit/object-detection-using-fast-r-cnn" target="_blank" rel="noopener">Link</a><br></td>
+<td></td>
+<td></td>
+</tr>
+</tbody></table>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>预训练模型</tag>
+        <tag>模型源码</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>图像语义分割之ConvCRF</title>
+    <url>/blog/2020/06/12/%E5%9B%BE%E5%83%8F%E8%AF%AD%E4%B9%89%E5%88%86%E5%89%B2%E4%B9%8BConvCRF/</url>
+    <content><![CDATA[<h3 id="1、概述"><a href="#1、概述" class="headerlink" title="1、概述"></a>1、概述</h3><p>语义分割等结构化预测任务可以从条件随机场等概率图模型获取很多优势，但由于条件随机场的训练速度及训练难度，目前研究者基本上都仅使用卷积网络进行处理。本文提出了一种卷积条件随机场，它能以卷积运算的方式解决 CRF 的两个大问题，并结合 CNN 实现更好的语义分割效果。</p>
+<h3 id="2、面临问题"><a href="#2、面临问题" class="headerlink" title="2、面临问题"></a>2、面临问题</h3><p>语义图像分割旨在为图像中的每个像素生成分类标签，是视觉感知中的一个重要任务。卷积神经网络已在解决语义分割任务上取得了很好的效果 。虽然深层神经网络在提取局部特征和利用小感受野进行良好预测方面效果显著，但它们缺乏利用全局上下文信息的能力，无法直接建模预测之间的相互作用。因此，有人认为，简单的前馈卷积神经网络也许并不是完成类似语义分割等结构化预测任务的最佳选择 。为了解决上述问题，一些研究者成功地将卷积神经网络的有效性与条件随机场的建模能力相结合，以获得更好的性能 。尽管结构化模型的成功是无可争议的，但在最近的方法和研究成果却鲜有人问津。</p>
+<p>我们认为，导致这一现状的主要原因是条件随机场的学习速度非常缓慢，且难以优化。如何为条件随机场等结构化组件学习特征仍然是一个开放性研究问题，许多方法完全依赖于手动设定的高斯特征。此外，条件随机场的推断比卷积神经网络的推断要慢两个数量级，这使得基于条件随机场的方法在许多实际应用中的运行速度很慢。而当前条件随机场较长的训练时间，也使得人们无法进行更加深入的研究和实验。</p>
+<p>为了解决这两个问题，我们提出将条件独立性这一强假设添加到现有的全连接条件随机场（FullCRF）框架中。这使得我们可以将大部分推断重新表达为可以在 GPU 上高效实现的卷积操作，我们称之为卷积条件随机场（ConvCRF）。反向传播可用于训练 ConvCRF 的所有参数，ConvCRF 中的推断可以在不到 10ms 的时间内完成。与 FullCRF 相比，可以获得一到两个数量级的速度提升。我们相信，训练和推断上的速度提升将大大有利于未来的研究，同时我们也希望它可以帮助条件随机场重新成为解决结构化任务的流行方法。</p>
+<h3 id="3、卷积条件随机场"><a href="#3、卷积条件随机场" class="headerlink" title="3、卷积条件随机场"></a>3、卷积条件随机场</h3><p>卷积条件随机场（ConvCRF）用条件独立假设补充 FullCRF。如果两个像素 i，j 的曼哈顿距离 d 可以保持 d(i, j) &gt; k 的关系，那么我们认为他们的标签分布是条件独立的。其中我们把超参数 k 称为滤波器尺寸。</p>
+<p>局部性假设是一个非常有力的假设，它暗示所有距离超过 k 的像素，成对相关性为零。这极大地降低了潜在成对性的复杂性。因为卷积神经网络基于局部特征处理可以取得很好的效果，那么我们也可以认为该假定在卷积神经网络上也是有效的。这使得卷积条件随机场的理论基础看起来很有前景，因为强大而有效的假设构成了机器学习建模的重要力量。</p>
+<h3 id="4、卷积条件随机场中的高效信息传递"><a href="#4、卷积条件随机场中的高效信息传递" class="headerlink" title="4、卷积条件随机场中的高效信息传递"></a>4、卷积条件随机场中的高效信息传递</h3><p>本文的主要贡献之一是证明信息传递在卷积条件随机场中是高效的。因此我们不需要使用 Permutohedral lattice 近似，从而可以进行高效的 GPU 计算和完整的特征学习。为了实现这个目标，我们将信息传递步骤重新配置为带截断高斯核的卷积，并注意到这非常类似于 CNN 中的常规卷积实现。</p>
+<p>考虑形状为 [bs，c，h，w] 的输入 P，其中 bs，c，h，w 分别表示批大小，类别数量，输入高度和宽度。对于由特征向量 f_1 … f_d 定义的高斯核 g，我们为它定义一个大小为 [bs, h, w] 的核矩阵：</p>
+<p><img src="1.png" alt></p>
+<p>其中 θ_i 是可学习的参数。对于一组高斯核 g_1 … g_s，我们定义经合并的核矩阵 K 为：</p>
+<p><img src="2.png" alt></p>
+<p>所有 s 个核的组合信息传递的结果 Q 如下所示：</p>
+<p><img src="3.png" alt></p>
+<p>这种信息传递操作类似于卷积神经网络中标准的二维卷积。然而，在我们的例子中，滤波器的值取决于空间维度 x 和 y。这与局部连接层相似 [8]。与局部连接层和二维卷积不同的是，我们的滤波器的通道维度 c 是不变的，我们一般可以将这种操作看作是维度 c^2 上的卷积。</p>
+<p>通过仅使用标准的卷积神经网络操作来实现我们这种卷积是可能的。然而，这要求数据在 GPU 内存中重新组织好几次，这是一个非常缓慢的过程。分析显示 90％ 的 GPU 时间开销用于数据重组。因此，我们选择建立一个本地的底层实现，以获得额外 10 倍的加速。</p>
+<p>我们可以通过类似于二维卷积（和局部连接层）来实现我们这种卷积的高效计算。第一步是平铺输入 P 以获得形状为 [bs，c，k，k，h，w] 的数据。这个过程通常被称为 im2col，与二维卷积相同 [9]。二维卷积通过在空间维度上批量进行矩阵乘法来完成，我们用通道维度上的批量点积来代替这一步骤，其它所有步骤都是相同的。</p>
+<h3 id="5、实验结果"><a href="#5、实验结果" class="headerlink" title="5、实验结果"></a>5、实验结果</h3><p><img src="4.jpg" alt></p>
+<p>图 1：合成任务的可视化分析。特别是在最后一个例子中，我们可以在物体边界处清楚地看到的来自 permutohedral lattice 近似的伪影。</p>
+<p>实验中，我们在训练集的 200 幅留存图像上训练条件随机场模型，并在官方 Pascal VOC 数据集的 1464 幅图像上对它的性能进行评估。我们在表 2 中报告了我们的结果，图 3 为模型输出的可视化分析。</p>
+<p><img src="5.jpg" alt></p>
+<p>表 2：使用解耦训练的条件随机场在验证集上的性能比较。+ C 表示模型使用卷积作为兼容性转换，+ T 表示模型学习了高斯特征。除了来自 DeepLab 的条件随机场，其他模型我们都使用一元运算（unaries）。</p>
+<p><img src="6.jpg" alt></p>
+<p>图 3：使用解耦训练策略在 Pascal VOC 数据下的结果可视化。示例 2 和 4 描述了条件随机场无法改进一元运算（unary）的失败情况。</p>
+<p>对于具有挑战性的语义图像分割任务，最有效的模型传统上将条件随机场（CRF）的结构化建模能力与卷积神经网络的特征提取能力结合起来。然而，在最近的工作中中，使用条件随机场进行后处理已经不再受到人们青睐。我们认为这主要是由于条件随机场训练和推断速度太过缓慢以及其参数学习的难度所致。为了克服这两个问题，我们提出将条件独立的假设添加到全连接条件随机场的框架中。这使得我们可以在 GPU 上高效地使用卷积操作重新进行推断。这样做可以将推断和训练加速超过 100 倍。卷积条件随机场的所有参数都可以使用反向传播轻松进行优化。</p>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>语义分割</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>工具网站</title>
+    <url>/blog/2020/07/22/%E5%B7%A5%E5%85%B7%E7%BD%91%E7%AB%99/</url>
+    <content><![CDATA[<p><a href="https://latexlive.com/" target="_blank" rel="noopener">LaTex公式编辑器</a><br><a href="https://learngitbranching.js.org/?locale=zh_CN" target="_blank" rel="noopener">Git命令练习</a><br><a href="https://regexr.com/" target="_blank" rel="noopener">正则表达式练习网站</a><br><a href="https://sqlzoo.net/" target="_blank" rel="noopener">SQL练习</a><br><a href="http://xxx.itp.ac.cn/" target="_blank" rel="noopener">arxiv国内镜像</a></p>
+]]></content>
+      <categories>
+        <category>linux</category>
+      </categories>
+      <tags>
+        <tag>工具网络</tag>
+        <tag>链接</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>常用数据集</title>
+    <url>/blog/2020/07/28/%E5%B8%B8%E7%94%A8%E6%95%B0%E6%8D%AE%E9%9B%86/</url>
+    <content><![CDATA[<blockquote>
+<p>合适的数据集对于深层神经网络的训练至关重要，今天我们一起来看看现在已经公开的数据集下载汇总，本文中的内容来源于网络。主要是方便自己以后学习工作中使用，本数据集定期更新。</p>
+</blockquote>
+<h2 id="1、金融类"><a href="#1、金融类" class="headerlink" title="1、金融类"></a>1、金融类</h2><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/139" target="_blank" rel="noopener">美国劳工部统计局官方发布数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/380" target="_blank" rel="noopener">房地产公司 Zillow 公开美国房地产历史数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/344" target="_blank" rel="noopener">沪深股票除权除息、配股增发全量数据，截止 2016.12.31</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/340" target="_blank" rel="noopener">上证主板日线数据，截止 2017.05.05，原始价、前复权价、后复权价，1260支股票</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/341" target="_blank" rel="noopener">深证主板日线数据，截止 2017.05.05，原始价、前复权价、后复权价，466支股票</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/342" target="_blank" rel="noopener">深证中小板日线数据，截止 2017.05.05，原始价、前复权价、后复权价，852支股票</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/343" target="_blank" rel="noopener">深证创业板日线数据，截止 2017.05.05，原始价、前复权价、后复权价，636支股票</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/37" target="_blank" rel="noopener">上证A股日线数据，1999.12.09至 2016.06.08，前复权，1095支股票</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/38" target="_blank" rel="noopener">深证A股日线数据，1999.12.09至 2016.06.08，前复权，1766支股票</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/39" target="_blank" rel="noopener">深证创业板日线数据，1999.12.09 至2016.06.08，前复权，510支股票</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/43" target="_blank" rel="noopener">MT4平台外汇交易历史数据</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/67" target="_blank" rel="noopener">Forex平台外汇交易历史数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/44" target="_blank" rel="noopener">几组外汇交易逐笔（Ticks）数据</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/220" target="_blank" rel="noopener">美国股票新闻数据【Kaggle数据】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/225" target="_blank" rel="noopener">美国医疗保险市场数据【Kaggle数据】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/229" target="_blank" rel="noopener">美国金融客户投诉数据【Kaggle数据】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/206" target="_blank" rel="noopener">Lending Club 网贷违约数据【Kaggle数据】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/214" target="_blank" rel="noopener">信用卡欺诈数据【Kaggle数据】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/249" target="_blank" rel="noopener">美国股票数据XBRL【Kaggle数据】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/266" target="_blank" rel="noopener">纽约股票交易所数据【Kaggle数据】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/336" target="_blank" rel="noopener">贷款违约预测竞赛数据【Kaggle竞赛】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/347" target="_blank" rel="noopener">Zillow 网站房地产价值预测竞赛数据【Kaggle竞赛】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/348" target="_blank" rel="noopener">Sberbank 俄罗斯房地产价值预测竞赛数据【Kaggle竞赛】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/355" target="_blank" rel="noopener">Homesite 保险定价竞赛数据【Kaggle竞赛】</a> </p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/356" target="_blank" rel="noopener">Winton 股票回报率预测竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/429" target="_blank" rel="noopener">房屋租赁信息查询次数预测竞赛【Kaggle竞赛】</a></p>
+<h2 id="2、交通"><a href="#2、交通" class="headerlink" title="2、交通"></a>2、交通</h2><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/76" target="_blank" rel="noopener">2013年纽约出租车行驶数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/323" target="_blank" rel="noopener">2013年芝加哥出租车行驶数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/86" target="_blank" rel="noopener">Udacity自动驾驶数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/210" target="_blank" rel="noopener">纽约Uber 接客数据 【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/232" target="_blank" rel="noopener">英国车祸数据（2005-2015）【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/228" target="_blank" rel="noopener">芝加哥汽车超速数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/270" target="_blank" rel="noopener">KITTI 自动驾驶任务数据【数据太大仅有部分】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/338" target="_blank" rel="noopener">德国交通标志识别数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/339" target="_blank" rel="noopener">交通信号识别数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/325" target="_blank" rel="noopener">芝加哥Divvy共享自行车骑行数据（2013年至今）</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/358" target="_blank" rel="noopener">美国查塔努加市共享单车骑行数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/359" target="_blank" rel="noopener">Capital 共享单车骑行数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/360" target="_blank" rel="noopener">Bay Area 共享单车骑行数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/361" target="_blank" rel="noopener">Nice Ride 共享单车骑行数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/324" target="_blank" rel="noopener">花旗银行共享单车骑行数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/349" target="_blank" rel="noopener">运用卫星数据跟踪亚马逊热带雨林中的人类轨迹竞赛【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/364" target="_blank" rel="noopener">纽约出租车管理委员会官方的乘车数据（2009年-2016年）</a></p>
+<h2 id="3、商业"><a href="#3、商业" class="headerlink" title="3、商业"></a>3、商业</h2><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/309" target="_blank" rel="noopener">Airbnb 开放的民宿信息和住客评论数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/207" target="_blank" rel="noopener">Amazon 食品评论数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/208" target="_blank" rel="noopener">Amazon 无锁手机评论数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/230" target="_blank" rel="noopener">美国视频游戏销售和评价数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/213" target="_blank" rel="noopener">Kaggle 各项竞赛情况数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/319" target="_blank" rel="noopener">Bosch 生产流水线降低次品率竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/337" target="_blank" rel="noopener">预测公寓租金竞赛数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/335" target="_blank" rel="noopener">广告点击预测竞赛数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/333" target="_blank" rel="noopener">餐厅营业收入预测建模竞赛</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/330" target="_blank" rel="noopener">银行产品推荐竞赛数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/329" target="_blank" rel="noopener">网站用户推荐点击预测竞赛数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/227" target="_blank" rel="noopener">在线广告实时竞价数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/350" target="_blank" rel="noopener">购物车商品关联竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/354" target="_blank" rel="noopener">Airbnb 新用户的民宿预定预测竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/391" target="_blank" rel="noopener">Yelp 点评网站公开数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/446" target="_blank" rel="noopener">KKBOX 音乐用户续订预测竞赛【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/426" target="_blank" rel="noopener">Grupo Bimbo 面包店库存和销量预测竞赛【Kaggle竞赛】</a></p>
+<h2 id="4、推荐系统"><a href="#4、推荐系统" class="headerlink" title="4、推荐系统"></a>4、推荐系统</h2><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/32" target="_blank" rel="noopener">Netflix 电影评价数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/116" target="_blank" rel="noopener">MovieLens 20m 电影推荐数据集 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/97" target="_blank" rel="noopener">WikiLens</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/101" target="_blank" rel="noopener">Jester HetRec2011 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/100" target="_blank" rel="noopener">Book Crossing Large MovieReview </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/290" target="_blank" rel="noopener">Retailrocket 商品评论和推荐数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/451" target="_blank" rel="noopener">1万本畅销书的6百万读者评分数据</a></p>
+<h2 id="5、医疗健康"><a href="#5、医疗健康" class="headerlink" title="5、医疗健康"></a>5、医疗健康</h2><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/80" target="_blank" rel="noopener">人识别物体时大脑核磁共振影像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/79" target="_blank" rel="noopener">人理解单词时大脑核磁共振影像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/121" target="_blank" rel="noopener">心脏病心房图像及标注数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/242" target="_blank" rel="noopener">细胞病理识别</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/124" target="_blank" rel="noopener">FIRE 视网膜眼底病变图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/250" target="_blank" rel="noopener">食物营养成分数据 【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/258" target="_blank" rel="noopener">EGG 大脑电波形状数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/261" target="_blank" rel="noopener">某人基因序列数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/275" target="_blank" rel="noopener">癌症CT影像数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/284" target="_blank" rel="noopener">软组织肉瘤CT图像数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/283" target="_blank" rel="noopener">美国国家健康与服务部-国家癌症研究所发起的癌症数据仓库介绍【仅有介绍】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/287" target="_blank" rel="noopener">Data ScienceBowl 2017 肺癌识别竞赛数据【数据太大仅有介绍】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/291" target="_blank" rel="noopener">TCGA-LUAD 肺癌CT图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/311" target="_blank" rel="noopener">RIDER Lung CT 肺癌CT影像</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/315" target="_blank" rel="noopener">TCGA-COAD癌症CT影像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/316" target="_blank" rel="noopener">TCIA-TCGA-OV 癌症CT影像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/317" target="_blank" rel="noopener">TCIA RIDER NEURO癌症MRI影像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/369" target="_blank" rel="noopener">QIN Beast 乳腺癌MRI影像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/400" target="_blank" rel="noopener">SPIE-AAPM-NCIPROSTATEx竞赛第1部分数据（MRI核磁共振影像识别前列腺癌程度数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/399" target="_blank" rel="noopener">SPIE-AAPM-NCIPROSTATEx竞赛第2部分数据（MRI核磁共振影像识别前列腺癌程度数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/415" target="_blank" rel="noopener">RIDER Breast 乳腺癌 MRI 影像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/416" target="_blank" rel="noopener">Lung Phantom 癌症 CT 影像数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/417" target="_blank" rel="noopener">TCIA-QIN-LUNG 肺癌 CT 影像数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/430" target="_blank" rel="noopener">医疗CT影像、年龄和对比标注数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/448" target="_blank" rel="noopener">TCGA-ESCA癌症 CT 影像数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/450" target="_blank" rel="noopener">TCGA-CESC癌症 CT 影像数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/449" target="_blank" rel="noopener">TCGA-KICH癌症 CT 影像数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/445" target="_blank" rel="noopener">从 CT 影像中对肺部影像进行分割并识别肺部容积【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/423" target="_blank" rel="noopener">通过Egg脑电图像预测患者癫痫病发作竞赛【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/424" target="_blank" rel="noopener">遗传突变分类竞赛【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/379" target="_blank" rel="noopener">MIMIC-III 临床监护数据</a></p>
+<h2 id="6、图像数据"><a href="#6、图像数据" class="headerlink" title="6、图像数据"></a>6、图像数据</h2><h3 id="6-1、综合图像"><a href="#6-1、综合图像" class="headerlink" title="6.1、综合图像"></a>6.1、综合图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/85" target="_blank" rel="noopener">Visual Genome 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/107" target="_blank" rel="noopener">Visual7w 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/51" target="_blank" rel="noopener">COCO 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/240" target="_blank" rel="noopener">SUFR 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/55" target="_blank" rel="noopener">ILSVRC 2014 训练数据（ImageNet的一部分）</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/40" target="_blank" rel="noopener">PASCAL Visual Object Classes 2012 图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/45" target="_blank" rel="noopener">PASCAL Visual Object Classes 2011 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/48" target="_blank" rel="noopener">PASCAL Visual Object Classes 2010 图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/138" target="_blank" rel="noopener">80 Million Tiny Image 图像数据【数据太大仅有介绍】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/83" target="_blank" rel="noopener">ImageNet【数据太大仅有介绍】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/183" target="_blank" rel="noopener">Google Open Images【数据太大仅有介绍】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/396" target="_blank" rel="noopener">Imagenet 小尺寸图像数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/371" target="_blank" rel="noopener">Yahoo Flickr 照片和视频数据集</a></p>
+<h3 id="6-2、场景图像"><a href="#6-2、场景图像" class="headerlink" title="6.2、场景图像"></a>6.2、场景图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/74" target="_blank" rel="noopener">Street Scences 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/112" target="_blank" rel="noopener">Places2 场景图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/160" target="_blank" rel="noopener">UCF GoogleStreet View 图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/234" target="_blank" rel="noopener">SUN 场景图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/173" target="_blank" rel="noopener">The Celebrity inPlaces 图像数据</a></p>
+<h3 id="6-3、Web标签图像"><a href="#6-3、Web标签图像" class="headerlink" title="6.3、Web标签图像"></a>6.3、Web标签图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/52" target="_blank" rel="noopener">HARRISON 社交标签图像</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/235" target="_blank" rel="noopener">NUS-WIDE 标签图像</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/236" target="_blank" rel="noopener">Visual Synset 标签图像 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/253" target="_blank" rel="noopener">Animals WithAttributes 标签图像</a></p>
+<h3 id="6-4、人形轮廓图像"><a href="#6-4、人形轮廓图像" class="headerlink" title="6.4、人形轮廓图像"></a>6.4、人形轮廓图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/129" target="_blank" rel="noopener">MPII Human Shape人体轮廓数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/110" target="_blank" rel="noopener">Biwi Kinect Head Pose 头部姿势数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/49" target="_blank" rel="noopener">上半身人像数据 INRIA Person 数据集</a></p>
+<h3 id="6-5、视觉文字识别图像"><a href="#6-5、视觉文字识别图像" class="headerlink" title="6.5、视觉文字识别图像"></a>6.5、视觉文字识别图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/47" target="_blank" rel="noopener">Street View House Number 门牌号图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/23" target="_blank" rel="noopener">MNIST 手写数字识别图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/203" target="_blank" rel="noopener">3D MNIST 数字识别图像数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/128" target="_blank" rel="noopener">MediaTeam Document 文档影印和内容数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/176" target="_blank" rel="noopener">Text Recognition 文字图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/278" target="_blank" rel="noopener">NIST Handprinted Forms and Characters 手写英文字符数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/294" target="_blank" rel="noopener">NIST Structured Forms Reference Set of Binary Images (SFRS) 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/295" target="_blank" rel="noopener">NIST Structured Forms Reference Set of Binary Images (SFRS) II 图像数据</a></p>
+<p><a href="http://filecremers3.informatik.tu-muenchen.de/~dl4cv/mnist.pkl.gz" target="_blank" rel="noopener">MNIST-M</a></p>
+<h3 id="6-6、特定一类事物图像"><a href="#6-6、特定一类事物图像" class="headerlink" title="6.6、特定一类事物图像"></a>6.6、特定一类事物图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/41" target="_blank" rel="noopener">著名的猫图像标注数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/105" target="_blank" rel="noopener">Caltech-UCSDBirds200 鸟类图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/106" target="_blank" rel="noopener">Stanford Car 汽车图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/106" target="_blank" rel="noopener">Cars 汽车图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/254" target="_blank" rel="noopener">MIT Cars 汽车图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/255" target="_blank" rel="noopener">Stanford Cars 汽车图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/109" target="_blank" rel="noopener">Food-101 美食图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/114" target="_blank" rel="noopener">17_Category_Flower 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/115" target="_blank" rel="noopener">102_Category_Flower 图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/60" target="_blank" rel="noopener">UCI Folio Leaf 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/61" target="_blank" rel="noopener">Labeled Fishes in the Wild 鱼类图像 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/63" target="_blank" rel="noopener">美国 Yelp 点评网站酒店照片</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/174" target="_blank" rel="noopener">CMU-Oxford Sculpture 塑像雕像图像 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/256" target="_blank" rel="noopener">Oxford-IIIT Pet 宠物图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/301" target="_blank" rel="noopener">Nature Conservancy Fisheries Monitoring 过度捕捞监控图像数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/373" target="_blank" rel="noopener">Stanford Dogs Dataset 数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/375" target="_blank" rel="noopener">辛普森一家卡通形象图像【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/392" target="_blank" rel="noopener">Fashion-MNIST 时尚服饰图像数据</a></p>
+<h3 id="6-7、材质纹理图像"><a href="#6-7、材质纹理图像" class="headerlink" title="6.7、材质纹理图像"></a>6.7、材质纹理图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/118" target="_blank" rel="noopener">CURET 纹理材质图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/111" target="_blank" rel="noopener">ETHZ Synthesizability 纹理图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/127" target="_blank" rel="noopener">KTH-TIPS 纹理材质图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/172" target="_blank" rel="noopener">Describable Textures 纹理图像数据</a></p>
+<h3 id="6-8、物体分类图像"><a href="#6-8、物体分类图像" class="headerlink" title="6.8、物体分类图像"></a>6.8、物体分类图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/71" target="_blank" rel="noopener">COIL-20 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/62" target="_blank" rel="noopener">COIL-100 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/70" target="_blank" rel="noopener">Caltech-101 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/54" target="_blank" rel="noopener">Caltech-256 图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/46" target="_blank" rel="noopener">CIFAR-10 图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/42" target="_blank" rel="noopener">CIFAR-100 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/53" target="_blank" rel="noopener">STL-10 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/72" target="_blank" rel="noopener">LabelMe_12_50k图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/69" target="_blank" rel="noopener">NORB v1.0 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/117" target="_blank" rel="noopener">NEC Toy Animal 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/237" target="_blank" rel="noopener">iCubWorld 图像分类数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/238" target="_blank" rel="noopener">Multi-class 图像分类数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/239" target="_blank" rel="noopener">GRAZ 图像分类数据</a></p>
+<h3 id="6-9、人脸图像"><a href="#6-9、人脸图像" class="headerlink" title="6.9、人脸图像"></a>6.9、人脸图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/108" target="_blank" rel="noopener">IMDB-WIKI 500k+ 人脸图像、年龄性别数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/68" target="_blank" rel="noopener">Labeled Faces in the Wild 人脸数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/50" target="_blank" rel="noopener">Extended Yale Face Database B 人脸数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/131" target="_blank" rel="noopener">Bao Face 人脸数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/87" target="_blank" rel="noopener">DC-IGN 论文人脸数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/119" target="_blank" rel="noopener">300 Face in Wild 图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/120" target="_blank" rel="noopener">BioID Face 人脸数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/122" target="_blank" rel="noopener">CMU Frontal Face Images</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/123" target="_blank" rel="noopener">FDDB_Face Detection Data Set and Benchmark</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/130" target="_blank" rel="noopener">NIST Mugshot Identification Database Faces in the Wild 人脸数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/170" target="_blank" rel="noopener">CelebA 名人人脸图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/175" target="_blank" rel="noopener">VGG Face 人脸图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/189" target="_blank" rel="noopener">Caltech 10k WebFaces 人脸图像数据</a></p>
+<h3 id="6-10、姿势动作图像"><a href="#6-10、姿势动作图像" class="headerlink" title="6.10、姿势动作图像"></a>6.10、姿势动作图像</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/125" target="_blank" rel="noopener">HMDB_a large human motion database</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/126" target="_blank" rel="noopener">Human Actionsand Scenes Dataset</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/177" target="_blank" rel="noopener">Buffy Stickmen V3 人体轮廓识别图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/178" target="_blank" rel="noopener">Human Pose Evaluator 人体轮廓识别图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/179" target="_blank" rel="noopener">Buffy pose 人类姿势图像数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/181" target="_blank" rel="noopener">VGG Human Pose Estimation 姿势图像标注数据</a></p>
+<h3 id="6-11、指纹识别"><a href="#6-11、指纹识别" class="headerlink" title="6.11、指纹识别"></a>6.11、指纹识别</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/197" target="_blank" rel="noopener">NIST FIGS 指纹识别数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/281" target="_blank" rel="noopener">NIST Supplemental Fingerprint Card Data (SFCD) 指纹识别数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/280" target="_blank" rel="noopener">NIST Plain and Rolled Images from Paired Fingerprint Cards in 500 pixels per inch 指纹识别数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/279" target="_blank" rel="noopener">NIST Plain and Rolled Images from Paired Fingerprint Cards 1000 pixels per inch 指纹识别数据</a></p>
+<h3 id="6-12、其它图像数据"><a href="#6-12、其它图像数据" class="headerlink" title="6.12、其它图像数据"></a>6.12、其它图像数据</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/77" target="_blank" rel="noopener">Visual Question Answering V1.0 图像数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/289" target="_blank" rel="noopener">Visual Question Answering V2.0 图像数据</a></p>
+<h2 id="7、视频数据"><a href="#7、视频数据" class="headerlink" title="7、视频数据"></a>7、视频数据</h2><h3 id="7-1、综合视频"><a href="#7-1、综合视频" class="headerlink" title="7.1、综合视频"></a>7.1、综合视频</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/132" target="_blank" rel="noopener">DAVIS_Densely Annotated Video Segmentation 数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/84" target="_blank" rel="noopener">YouTube-8M 视频数据集【数据太大仅有介绍】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/241" target="_blank" rel="noopener">YouTube 网站视频备份【数据太大仅有介绍】</a></p>
+<h3 id="7-2、人类动作视频"><a href="#7-2、人类动作视频" class="headerlink" title="7.2、人类动作视频"></a>7.2、人类动作视频</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/147" target="_blank" rel="noopener">Microsoft Research Action 人类动作视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/133" target="_blank" rel="noopener">UCF50 Action Recognition 动作识别数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/134" target="_blank" rel="noopener">UCF101 Action Recognition 动作识别数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/144" target="_blank" rel="noopener">UT-Interaction 人类动作视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/135" target="_blank" rel="noopener">UCF iPhone 运动中传感器数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/136" target="_blank" rel="noopener">UCF YouTube 人类动作视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/137" target="_blank" rel="noopener">UCF Sport 人类动作视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/148" target="_blank" rel="noopener">UCF-ARG 人类动作视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/125" target="_blank" rel="noopener">HMDB 人类动作视频</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/126" target="_blank" rel="noopener">HOLLYWOOD2 人类行为动作视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/141" target="_blank" rel="noopener">Recognition of human actions 动作视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/157" target="_blank" rel="noopener">Motion Capture 动作捕捉视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/146" target="_blank" rel="noopener">SBU Kinect Interaction 肢体动作视频数据 </a></p>
+<h3 id="7-3、目标检测视频"><a href="#7-3、目标检测视频" class="headerlink" title="7.3、目标检测视频"></a>7.3、目标检测视频</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/244" target="_blank" rel="noopener">UCSD Pedestrian 行人视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/245" target="_blank" rel="noopener">Caltech Pedestrian 行人视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/246" target="_blank" rel="noopener">ETH 行人视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/247" target="_blank" rel="noopener">INRIA 行人视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/248" target="_blank" rel="noopener">TudBrussels 行人视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/223" target="_blank" rel="noopener">Daimler 行人视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/159" target="_blank" rel="noopener">ALOV++ 物体追踪视频数据</a></p>
+<h3 id="7-4、密集人群视频"><a href="#7-4、密集人群视频" class="headerlink" title="7.4、密集人群视频"></a>7.4、密集人群视频</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/151" target="_blank" rel="noopener">Crowd Counting 高密度人群图像</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/150" target="_blank" rel="noopener">Crowd Segmentation 高密度人群视频数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/152" target="_blank" rel="noopener">Tracking in High Density Crowds 高密度人群视频</a> </p>
+<h3 id="7-5、其它视频"><a href="#7-5、其它视频" class="headerlink" title="7.5、其它视频"></a>7.5、其它视频</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/156" target="_blank" rel="noopener">Fire Detection 视频数据</a></p>
+<h2 id="8、音频数据"><a href="#8、音频数据" class="headerlink" title="8、音频数据"></a>8、音频数据</h2><h3 id="8-1、综合音频"><a href="#8-1、综合音频" class="headerlink" title="8.1、综合音频"></a>8.1、综合音频</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/243" target="_blank" rel="noopener">Google Audioset 音频数据【数据太大仅有介绍】</a></p>
+<h3 id="8-2、语音识别"><a href="#8-2、语音识别" class="headerlink" title="8.2、语音识别"></a>8.2、语音识别</h3><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/200" target="_blank" rel="noopener">Sinhala TTS 英语语音识别</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/186" target="_blank" rel="noopener">TIMIT 美式英语语音识别数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/164" target="_blank" rel="noopener">LibriSpeech ASR corpus 语音数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/251" target="_blank" rel="noopener">Room Impulse Response and Noise 语音数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/252" target="_blank" rel="noopener">ALFFA 非洲语音数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/194" target="_blank" rel="noopener">THUYG-20 维吾尔语语音数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/191" target="_blank" rel="noopener">AMI Corpus 语音识别</a></p>
+<h2 id="9、自然语言处理"><a href="#9、自然语言处理" class="headerlink" title="9、自然语言处理"></a>9、自然语言处理</h2><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/96" target="_blank" rel="noopener">RCV1英语新闻数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/93" target="_blank" rel="noopener">20news 英语新闻数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/90" target="_blank" rel="noopener">First Quora Release Question Pairs 问答数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/78" target="_blank" rel="noopener">JRC Names各国语言专有实体名称 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/94" target="_blank" rel="noopener">Multi-Domain Sentiment V2.0</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/92" target="_blank" rel="noopener">LETOR 信息检索数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/89" target="_blank" rel="noopener">Yale Youtube Vedio Text斯坦福问答数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/221" target="_blank" rel="noopener">美国假新闻数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/212" target="_blank" rel="noopener">NIPS会议文章信息数据（1987-2016）【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/268" target="_blank" rel="noopener">2016年美国总统选举辩论数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/269" target="_blank" rel="noopener">WikiLinks 跨文档指代语料</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/277" target="_blank" rel="noopener">European Parliament Proceedings Parallel Corpus 机器翻译数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/285" target="_blank" rel="noopener">WikiText 英语语义词库数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/272" target="_blank" rel="noopener">WMT 2011 News Crawl 机器翻译数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/288" target="_blank" rel="noopener">Stanford Sentiment Treebank 词汇数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/334" target="_blank" rel="noopener">英语语言模型单词预测竞赛数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/401" target="_blank" rel="noopener">WikiAnswers 问题复述数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/402" target="_blank" rel="noopener">中文经典典籍语料</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/403" target="_blank" rel="noopener">几个网上采集的自然语言语料中文姓名语料</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/405" target="_blank" rel="noopener">81万互联网词汇词库</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/406" target="_blank" rel="noopener">Question-Answer 问答数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/397" target="_blank" rel="noopener">Wikilinks 跨文档语料扩展版</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/398" target="_blank" rel="noopener">几个聊天机器人语料</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/384" target="_blank" rel="noopener">TED 平行语料库</a></p>
+<h2 id="10、社会数据"><a href="#10、社会数据" class="headerlink" title="10、社会数据"></a>10、社会数据</h2><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/201" target="_blank" rel="noopener">希拉里邮件门泄露邮件 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/267" target="_blank" rel="noopener">波士顿Airbnb 公开数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/209" target="_blank" rel="noopener">世界各国经济发展数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/202" target="_blank" rel="noopener">世界大学排名芝加哥犯罪数据（2001-2017）【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/233" target="_blank" rel="noopener">世界范围显著地震数据（1965-2016）【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/231" target="_blank" rel="noopener">美国婴儿姓名数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/222" target="_blank" rel="noopener">全世界鲨鱼袭击人类数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/219" target="_blank" rel="noopener">1908年以来空难数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/218" target="_blank" rel="noopener">2016年美国总统大选数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/217" target="_blank" rel="noopener">2013年美国社区统计数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/273" target="_blank" rel="noopener">2014年美国社区统计数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/274" target="_blank" rel="noopener">2015年美国社区统计数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/215" target="_blank" rel="noopener">欧洲足球运动员赛事表现数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/211" target="_blank" rel="noopener">美国环境污染数据【Kaagle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/224" target="_blank" rel="noopener">美国H1-B签证申请数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/226" target="_blank" rel="noopener">IMDB五千部电影数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/216" target="_blank" rel="noopener">2015年航班延误和取消数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/259" target="_blank" rel="noopener">凶杀案报告数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/260" target="_blank" rel="noopener">人力资源分析数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/262" target="_blank" rel="noopener">美国费城犯罪数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/263" target="_blank" rel="noopener">安然公司邮件数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/264" target="_blank" rel="noopener">历史棒球数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/265" target="_blank" rel="noopener">美联航 Twitter 用户评论数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/267" target="_blank" rel="noopener">波士顿 Airbnb 公开数据【Kaggle数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/353" target="_blank" rel="noopener">芝加哥市2001年以来犯罪记录数据 </a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/358" target="_blank" rel="noopener">美国查塔努加市犯罪记录数据（2003年至今）</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/351" target="_blank" rel="noopener">芝加哥街边咖啡厅季节中的人行道咖啡厅许可数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/352" target="_blank" rel="noopener">芝加哥餐馆卫生检查结果数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/370" target="_blank" rel="noopener">几个人类运动位置路线GPS数据集（骑行、跑步等）</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/431" target="_blank" rel="noopener">希拉里 vs 特朗普竞选期间 Twitter 数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/432" target="_blank" rel="noopener">美国连环凶案数据（1980-2014）【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/434" target="_blank" rel="noopener">广告实时竞价数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/435" target="_blank" rel="noopener">美国费城犯罪记录数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/436" target="_blank" rel="noopener">Reddit 用户交互记录【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/420" target="_blank" rel="noopener">泰坦尼克灾难数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/421" target="_blank" rel="noopener">Wikipedia 页面点击流量数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/422" target="_blank" rel="noopener">纽约市出租车乘车时间预测竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/427" target="_blank" rel="noopener">新闻和网页内容推荐及点击竞赛【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/393" target="_blank" rel="noopener">科比布莱恩特投篮命中率数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/381" target="_blank" rel="noopener">几个城市气象交换站日间天气数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/395" target="_blank" rel="noopener">Reddit 2.5 百万社交新闻数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/376" target="_blank" rel="noopener">Google的机群访问数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/390" target="_blank" rel="noopener">MIT Saliency 眼睛浏览轨迹数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/425" target="_blank" rel="noopener">根据安检人体扫描成像预测威胁竞赛【Kaggle竞赛】</a></p>
+<h2 id="11、处理后的科研和竞赛数据"><a href="#11、处理后的科研和竞赛数据" class="headerlink" title="11、处理后的科研和竞赛数据"></a>11、处理后的科研和竞赛数据</h2><p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/296" target="_blank" rel="noopener">NIPS 2003 属性选择竞赛数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/297" target="_blank" rel="noopener">台湾大学林智仁教授处理为 LibSVM 格式的分类建模数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/298" target="_blank" rel="noopener">Large-scale 分类建模数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/299" target="_blank" rel="noopener">几个UCI 中 large-scale 分类建模数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/300" target="_blank" rel="noopener">Social Computing Data Repository 社交网络数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/318" target="_blank" rel="noopener">猫和狗分类识别竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/328" target="_blank" rel="noopener">DSTL 卫星图像识别竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/332" target="_blank" rel="noopener">根据手机应用软件使用行为预测用户性别年龄竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/331" target="_blank" rel="noopener">人脸关键点标定竞赛数据【Kaggle竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/368" target="_blank" rel="noopener">Kaggle竞赛数据合辑（部分竞赛数据）</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/437" target="_blank" rel="noopener">UCI多分类组合出的二分类数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/438" target="_blank" rel="noopener">UCI经典二分类数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/439" target="_blank" rel="noopener">场景图像分类竞赛数据【ChallengerAI 竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/440" target="_blank" rel="noopener">人体骨骼关键点检测竞赛数据【ChallengerAI 竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/441" target="_blank" rel="noopener">图像中文表述竞赛数据【ChallengerAI 竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/442" target="_blank" rel="noopener">英文同声传译竞赛数据【ChallengerAI 竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/443" target="_blank" rel="noopener">中英文本翻译竞赛数据【ChallengerAI 竞赛】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/444" target="_blank" rel="noopener">虚拟股票趋势预测【ChallengerAI 竞赛数据】</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/394" target="_blank" rel="noopener">机器视觉推理实验数据</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/418" target="_blank" rel="noopener">BigMM 2015 竞赛验证数据集</a></p>
+<p><a href="http://dataju.cn/Dataju/web/datasetInstanceDetail/447" target="_blank" rel="noopener">KONECT 网络图结构和网络科学数据合辑</a></p>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>数据集</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>我爱你，胜过爱自己</title>
+    <url>/blog/2020/07/14/%E6%88%91%E7%88%B1%E4%BD%A0%EF%BC%8C%E8%83%9C%E8%BF%87%E7%88%B1%E8%87%AA%E5%B7%B1/</url>
+    <content><![CDATA[<p><img src="1.png" alt></p>
+<p>你是秋夜里的盈盈月光，<br>夏日里的声声蝉鸣。<br>声声清脆，<br>印如灵魂的天籁，<br>束束薄纱，<br>抚平半生的荣华。</p>
+<p>若没有二月二十二的契约，<br>你我可能微笑着擦肩，<br>今生不再挂牵，<br>你的生命，<br>会有另一个陪伴。</p>
+<p>幸好，<br>命运的足记，<br>终究没有忽略，<br>痴行的少年。</p>
+<p>从此，<br>秋日不再萧瑟，<br>夕阳不再孤寂，<br>流连于城市的繁华，<br>钟情于家庭的唯一。</p>
+<p>我爱你，<br>胜过爱自己。</p>
+]]></content>
+      <categories>
+        <category>lifestyle</category>
+      </categories>
+      <tags>
+        <tag>文刀</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>数据增强综述</title>
+    <url>/blog/2020/07/27/%E6%95%B0%E6%8D%AE%E5%A2%9E%E5%BC%BA%E7%BB%BC%E8%BF%B0/</url>
+    <content><![CDATA[<h2 id="1、概述"><a href="#1、概述" class="headerlink" title="1、概述"></a>1、概述</h2><p>很多实际的项目，我们都难以有充足的数据来完成任务，要保证完美的完成任务，有两件事情需要做好：</p>
+<ul>
+<li>寻找更多的数据</li>
+<li>数据增强（data augmentation）</li>
+</ul>
+<p><strong>什么是数据增强</strong><br>数据增强也叫数据扩增，意思是在不实质性的增加数据的情况下，让有限的数据产生等价于更多数据的价值。</p>
+<p><img src="1.jpg" alt></p>
+<p>数据增强可以分为<strong>有监督的数据增强和无监督的数据增强方法</strong>。其中有监督的数据增强又可以分为<strong>单样本数据增强和多样本数据增强方法，无监督的数据增强分为生成新的数据和学习增强策略两个方向</strong>。</p>
+<h2 id="2、有监督的数据增强"><a href="#2、有监督的数据增强" class="headerlink" title="2、有监督的数据增强"></a>2、有监督的数据增强</h2><p>有监督数据增强，即<strong>采用预设的数据变换规则，在已有数据的基础上进行数据的扩增</strong>，包含单样本数据增强和多样本数据增强。</p>
+<h3 id="2-1、单样本数据增强"><a href="#2-1、单样本数据增强" class="headerlink" title="2.1、单样本数据增强"></a>2.1、单样本数据增强</h3><p>单样本数据增强，即增强一个样本的时候，全部围绕着该样本本身进行操作，包括<strong>几何变换类，颜色变换类等</strong>。</p>
+<h4 id="2-1-1、几何变换类"><a href="#2-1-1、几何变换类" class="headerlink" title="2.1.1、几何变换类"></a>2.1.1、几何变换类</h4><p>几何变换类即对图像进行几何变换，包括<strong>翻转，旋转，裁剪，变形，缩放</strong>等各类操作.</p>
+<blockquote>
+<p><strong>翻转</strong></p>
+</blockquote>
+<p>翻转包括水平翻转和垂直翻转。</p>
+<p><img src="2.webp" alt></p>
+<blockquote>
+<p><strong>随机裁剪</strong></p>
+</blockquote>
+<p>裁剪图片的感兴趣区域（ROI），通常在训练的时候，会采用随机裁剪的方法，下图为随机裁剪4次的效果。</p>
+<p><img src="3.webp" alt></p>
+<blockquote>
+<p><strong>随机旋转</strong></p>
+</blockquote>
+<p>对图像做一定角度对旋转操作.</p>
+<p><img src="4.webp" alt></p>
+<blockquote>
+<p><strong>缩放变形</strong></p>
+</blockquote>
+<p>随机选取图像的一部分，然后将其缩放到原图像尺度。</p>
+<p><img src="5.webp" alt></p>
+<p>翻转操作和旋转操作，对于那些对方向不敏感的任务，比如图像分类，都是很常见的操作，在caffe等框架中翻转对应的就是mirror操作。</p>
+<p>翻转和旋转不改变图像的大小，而裁剪会改变图像的大小。通常在训练的时候会采用随机裁剪的方法，在测试的时候选择裁剪中间部分或者不裁剪。值得注意的是，在一些竞赛中进行模型测试时，一般都是裁剪输入的多个版本然后将结果进行融合，对预测的改进效果非常明显。</p>
+<p>以上操作都不会产生失真，而缩放变形则是失真的。</p>
+<p>很多的时候，网络的训练输入大小是固定的，但是数据集中的图像却大小不一，此时就可以选择上面的裁剪成固定大小输入或者缩放到网络的输入大小的方案，后者就会产生失真，通常效果比前者差。</p>
+<blockquote>
+<p><strong>仿射变换(Affine Transformation)</strong></p>
+</blockquote>
+<p>同时对图片做裁剪、旋转、转换、模式调整等多重操作。</p>
+<p>Affine Transformation是一种二维坐标到二维坐标之间的线性变换，保持二维图形的“平直性”（译注：straightness，即变换后直线还是直线不会打弯，圆弧还是圆弧）和“平行性”（译注：parallelness，其实是指保二维图形间的相对位置关系不变，平行线还是平行线，相交直线的交角不变。）</p>
+<p><img src="7.png" alt></p>
+<p>仿射变换可以通过一系列的原子变换的复合来实现，包括：平移（Translation）、缩放（Scale）、翻转（Flip）、旋转（Rotation）和剪切（Shear）。</p>
+<p><img src="6.webp" alt></p>
+<blockquote>
+<p><strong>透视变换</strong></p>
+</blockquote>
+<p>透视变换（Perspective Transformation）的本质是将图像投影到一个新的视平面，也称作投影映射。它是二维（x,y）到三维(X,Y,Z)，再到另一个二维(x’,y’)空间的映射。</p>
+<p>仿射变换后平行四边形的各边仍操持平行，透视变换结果允许是梯形等四边形，所以仿射变换是透视变换的子集。</p>
+<p>对图像应用一个随机的四点透视变换。</p>
+<p><img src="8.webp" alt></p>
+<h4 id="2-1-2、颜色变换类"><a href="#2-1-2、颜色变换类" class="headerlink" title="2.1.2、颜色变换类"></a>2.1.2、颜色变换类</h4><p>上面的几何变换类操作，没有改变图像本身的内容，它可能是选择了图像的一部分或者对像素进行了重分布。如果要改变图像本身的内容，就属于颜色变换类的数据增强了，常见的包括<strong>噪声、模糊、颜色变换、擦除、填充</strong>等等。</p>
+<p>基于噪声的数据增强就是在原来的图片的基础上，随机叠加一些噪声，最常见的做法就是<strong>高斯噪声</strong>。更复杂一点的就是在面积大小可选定、位置随机的矩形区域上丢弃像素产生黑色矩形块，从而产生一些彩色噪声，以Coarse Dropout方法为代表，甚至还可以对图片上随机选取一块区域并擦除图像信息。</p>
+<p><strong>噪声类：</strong></p>
+<blockquote>
+<p><strong>高斯噪声</strong></p>
+</blockquote>
+<p>高斯噪声是指它的概率密度函数服从高斯分布（即正态分布）的一类噪声。如果一个噪声，它的幅度分布服从高斯分布，而它的功率谱密度又是均匀分布的，则称它为高斯白噪声。高斯白噪声的二阶矩不相关，一阶矩为常数，是指先后信号在时间上的相关性。</p>
+<p>概率密度函数:</p>
+<p><img src="10.png" alt></p>
+<p>σ为z的标准差,z为均值</p>
+<p><img src="9.webp" alt></p>
+<blockquote>
+<p><strong>椒盐噪声</strong></p>
+</blockquote>
+<p>椒盐噪声是根据图像的信噪比,随机生成一些图像内的像素位置,并随机对这些像素点赋值为0或255。</p>
+<p>概率密度函数:</p>
+<p><img src="11.png" alt></p>
+<blockquote>
+<p><strong>CoarseDropout</strong></p>
+</blockquote>
+<p>在面积大小可选定、位置随机的矩形区域上丢失信息实现转换，所有通道的信息丢失产生黑色矩形块，部分通道的信息丢失产生彩色噪声。</p>
+<p><img src="12.webp" alt></p>
+<blockquote>
+<p><strong>SimplexNoiseAlpha</strong></p>
+</blockquote>
+<p>产生连续单一噪声的掩模后，将掩模与原图像混合</p>
+<p><img src="13.webp" alt></p>
+<blockquote>
+<p><strong>FrequencyNoiseAlpha</strong></p>
+</blockquote>
+<p>在频域中用随机指数对噪声映射进行加权，再转换到空间域。在不同图像中，随着指数值逐渐增大，依次出现平滑的大斑点、多云模式、重复出现的小斑块</p>
+<p><img src="14.webp" alt></p>
+<p><strong>模糊类：</strong></p>
+<p>减少各像素点值的差异实现图片模糊，实现像素的平滑化。</p>
+<blockquote>
+<p><strong>高斯模糊</strong></p>
+</blockquote>
+<p><img src="15.webp" alt></p>
+<blockquote>
+<p><strong>ElasticTransformation</strong></p>
+</blockquote>
+<p>根据扭曲场的平滑度与强度逐一地移动局部像素点实现模糊效果。</p>
+<p><img src="16.webp" alt></p>
+<blockquote>
+<p><strong>HSV对比度变换</strong></p>
+</blockquote>
+<p>通过向HSV空间中的每个像素添加或减少V值，修改色调和饱和度实现对比度转换。</p>
+<p><img src="17.webp" alt></p>
+<blockquote>
+<p><strong>RGB颜色扰动</strong></p>
+</blockquote>
+<p>将图片从RGB颜色空间转换到另一颜色空间，增加或减少颜色参数后返回RGB颜色空间。</p>
+<p><img src="18.webp" alt></p>
+<blockquote>
+<p><strong>随机擦除法</strong></p>
+</blockquote>
+<p>对图片上随机选取一块区域，随机地擦除图像信息。</p>
+<p><img src="19.webp" alt></p>
+<blockquote>
+<p><strong>超像素法（Superpixels）</strong></p>
+</blockquote>
+<p>在最大分辨率处生成图像的若干个超像素，并将其调整到原始大小，再将原始图像中所有超像素区域按一定比例替换为超像素，其他区域不改变。</p>
+<p><img src="20.webp" alt></p>
+<blockquote>
+<p><strong>转换法（invert）</strong></p>
+</blockquote>
+<p>按给定的概率值将部分或全部通道的像素值从v设置为255-v。</p>
+<p><img src="21.webp" alt></p>
+<blockquote>
+<p><strong>边界检测（EdgeDetect）</strong></p>
+</blockquote>
+<p>检测图像中的所有边缘，将它们标记为黑白图像，再将结果与原始图像叠加。</p>
+<p><img src="22.webp" alt></p>
+<blockquote>
+<p><strong>GrayScale</strong></p>
+</blockquote>
+<p>将图像从RGB颜色空间转换为灰度空间，通过某一通道与原图像混合。</p>
+<p><img src="23.webp" alt></p>
+<blockquote>
+<p><strong>锐化（sharpen）与浮雕（emboss）</strong></p>
+</blockquote>
+<p>对图像执行某一程度的锐化或浮雕操作，通过某一通道将结果与图像融合。</p>
+<p>下图分别是锐化与浮雕效果图:</p>
+<p><img src="24.webp" alt></p>
+<h3 id="2-2、多样本数据增强"><a href="#2-2、多样本数据增强" class="headerlink" title="2.2、多样本数据增强"></a>2.2、多样本数据增强</h3><p>不同于单样本数据增强，多样本数据增强方法利用多个样本来产生新的样本，下面介绍几种方法:</p>
+<h4 id="2-2-1、SMOTE"><a href="#2-2-1、SMOTE" class="headerlink" title="2.2.1、SMOTE"></a>2.2.1、SMOTE</h4><p>SMOTE即Synthetic Minority Over-sampling Technique方法，它是通过人工合成新样本来处理样本不平衡问题，从而提升分类器性能。</p>
+<p>类不平衡现象是很常见的，它指的是数据集中各类别数量不近似相等。如果样本类别之间相差很大，会影响分类器的分类效果。假设小样本数据数量极少，如仅占总体的1%，则即使小样本被错误地全部识别为大样本，在经验风险最小化策略下的分类器识别准确率仍能达到99%，但由于没有学习到小样本的特征，实际分类效果就会很差。</p>
+<p>SMOTE方法是基于插值的方法，它可以为小样本类合成新的样本，主要流程为：</p>
+<ul>
+<li><p>第一步，定义好特征空间，将每个样本对应到特征空间中的某一点，根据样本不平衡比例确定好一个采样倍率N；</p>
+</li>
+<li><p>第二步，对每一个小样本类样本(x,y)，按欧氏距离找出K个最近邻样本，从中随机选取一个样本点，假设选择的近邻点为(xn,yn)。在特征空间中样本点与最近邻样本点的连线段上随机选取一点作为新样本点，满足以下公式：</p>
+</li>
+</ul>
+<p><img src="25.jpg" alt></p>
+<ul>
+<li>第三步，重复以上的步骤，直到大、小样本数量平衡。</li>
+</ul>
+<p>在python中，SMOTE算法已经封装到了imbalanced-learn库中，如下图为算法实现的数据增强的实例，左图为原始数据特征空间图，右图为SMOTE算法处理后的特征空间图:</p>
+<p><img src="26.webp" alt></p>
+<h4 id="2-2-2、SamplePairing"><a href="#2-2-2、SamplePairing" class="headerlink" title="2.2.2、SamplePairing"></a>2.2.2、SamplePairing</h4><p>SamplePairing方法的原理非常简单，从训练集中随机抽取两张图片分别经过基础数据增强操作(如随机翻转等)处理后经像素以取平均值的形式叠加合成一个新的样本，标签为原样本标签中的一种。这两张图片甚至不限制为同一类别，这种方法对于医学图像比较有效。</p>
+<p><img src="27.webp" alt></p>
+<p>训练过程是交替禁用与使用SamplePairing处理操作的结合：</p>
+<ul>
+<li><p>使用传统的数据增强训练网络，不使用SamplePairing 数据增强训练。</p>
+</li>
+<li><p>在ILSVRC数据集上完成一个epoch或在其他数据集上完成100个epoch后，加入SamplePairing 数据增强训练。</p>
+</li>
+<li><p>间歇性禁用 SamplePairing。对于 ILSVRC 数据集，为其中的300000 个图像启用SamplePairing，然后在接下来的100000个图像中禁用它。对于其他数据集，在开始的8个epoch中启用，在接下来的2个epoch中禁止。</p>
+</li>
+<li><p>在训练损失函数和精度稳定后进行微调，禁用SamplePairing。</p>
+</li>
+</ul>
+<p>经SamplePairing处理后可使训练集的规模从N扩增到N×N。实验结果表明，因SamplePairing数据增强操作可能引入不同标签的训练样本，导致在各数据集上使用SamplePairing训练的误差明显增加，而在验证集上误差则有较大幅度降低。</p>
+<p>尽管SamplePairing思路简单，性能上提升效果可观，符合奥卡姆剃刀原理，但遗憾的是可解释性不强。</p>
+<h4 id="2-2-3、mixup"><a href="#2-2-3、mixup" class="headerlink" title="2.2.3、mixup"></a>2.2.3、mixup</h4><p>mixup是Facebook人工智能研究院和MIT在“Beyond Empirical Risk Minimization”中提出的基于邻域风险最小化原则的数据增强方法，它使用线性插值得到新样本数据。</p>
+<p>令(xn,yn)是插值生成的新数据，(xi,yi)和(xj,yj)是训练集随机选取的两个数据，则数据生成方式如下:</p>
+<p><img src="28.jpg" alt></p>
+<p>λ的取指范围介于0到1。提出mixup方法的作者们做了丰富的实验，实验结果表明可以改进深度学习模型在ImageNet数据集、CIFAR数据集、语音数据集和表格数据集中的泛化误差，降低模型对已损坏标签的记忆，增强模型对对抗样本的鲁棒性和训练生成对抗网络的稳定性。</p>
+<p><strong>SMOTE，SamplePairing，mixup三者思路上有相同之处，都是试图将离散样本点连续化来拟合真实样本分布</strong>，不过所增加的样本点在特征空间中仍位于已知小样本点所围成的区域内。如果能够在给定范围之外适当插值，也许能实现更好的数据增强效果。</p>
+<h2 id="3、无监督的数据增强"><a href="#3、无监督的数据增强" class="headerlink" title="3、无监督的数据增强"></a>3、无监督的数据增强</h2><p>无监督的数据增强方法包括两类：</p>
+<ul>
+<li>通过模型学习数据的分布，随机生成与训练数据集分布一致的图片，代表方法GAN</li>
+<li>通过模型，学习出适合当前任务的数据增强方法，代表方法AutoAugment</li>
+</ul>
+<h3 id="3-1、GAN"><a href="#3-1、GAN" class="headerlink" title="3.1、GAN"></a>3.1、GAN</h3><p>关于GAN(generative adversarial networks)，它包含两个网络，一个是生成网络，一个是对抗网络，基本原理如下：</p>
+<ul>
+<li>G是一个生成图片的网络，它接收随机的噪声z，通过噪声生成图片，记做G(z) 。</li>
+<li>D是一个判别网络，判别一张图片是不是“真实的”，即是真实的图片，还是由G生成的图片。</li>
+</ul>
+<h3 id="3-2、Autoaugmentation"><a href="#3-2、Autoaugmentation" class="headerlink" title="3.2、Autoaugmentation"></a>3.2、Autoaugmentation</h3><p>AutoAugment是Google提出的自动选择最优数据增强方案的研究，这是无监督数据增强的重要研究方向。它的基本思路是使用增强学习从数据本身寻找最佳图像变换策略，对于不同的任务学习不同的增强方法。</p>
+<h2 id="4、参考代码"><a href="#4、参考代码" class="headerlink" title="4、参考代码"></a>4、参考代码</h2><figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">train_parameters &#x3D; &#123;</span><br><span class="line">    &quot;input_size&quot;: [3, 224, 224],</span><br><span class="line">    &quot;image_enhance_strategy&quot;: &#123;  # 图像增强相关策略</span><br><span class="line">        &quot;need_distort&quot;: True,  # 是否启用图像颜色增强</span><br><span class="line">        &quot;need_rotate&quot;: True,   # 是否需要增加随机角度</span><br><span class="line">        &quot;need_crop&quot;: True,      # 是否要增加裁剪</span><br><span class="line">        &quot;need_flip&quot;: True,      # 是否要增加水平随机翻转</span><br><span class="line">        &quot;hue_prob&quot;: 0.5,</span><br><span class="line">        &quot;hue_delta&quot;: 18,</span><br><span class="line">        &quot;contrast_prob&quot;: 0.5,</span><br><span class="line">        &quot;contrast_delta&quot;: 0.5,</span><br><span class="line">        &quot;saturation_prob&quot;: 0.5,</span><br><span class="line">        &quot;saturation_delta&quot;: 0.5,</span><br><span class="line">        &quot;brightness_prob&quot;: 0.5,</span><br><span class="line">        &quot;brightness_delta&quot;: 0.125</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line"># 数据处理</span><br><span class="line">def resize_img(img, target_size):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    强制缩放图片</span><br><span class="line">    :param img:</span><br><span class="line">    :param target_size:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    target_size &#x3D; input_size</span><br><span class="line">    img &#x3D; img.resize((target_size[1], target_size[2]), Image.BILINEAR)</span><br><span class="line">    return img</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def random_crop(img, scale&#x3D;[0.08, 1.0], ratio&#x3D;[3. &#x2F; 4., 4. &#x2F; 3.]):</span><br><span class="line">    aspect_ratio &#x3D; math.sqrt(np.random.uniform(*ratio))</span><br><span class="line">    w &#x3D; 1. * aspect_ratio</span><br><span class="line">    h &#x3D; 1. &#x2F; aspect_ratio</span><br><span class="line"></span><br><span class="line">    bound &#x3D; min((float(img.size[0]) &#x2F; img.size[1]) &#x2F; (w**2),</span><br><span class="line">                (float(img.size[1]) &#x2F; img.size[0]) &#x2F; (h**2))</span><br><span class="line">    scale_max &#x3D; min(scale[1], bound)</span><br><span class="line">    scale_min &#x3D; min(scale[0], bound)</span><br><span class="line"></span><br><span class="line">    target_area &#x3D; img.size[0] * img.size[1] * np.random.uniform(scale_min,</span><br><span class="line">                                                                scale_max)</span><br><span class="line">    target_size &#x3D; math.sqrt(target_area)</span><br><span class="line">    w &#x3D; int(target_size * w)</span><br><span class="line">    h &#x3D; int(target_size * h)</span><br><span class="line"></span><br><span class="line">    i &#x3D; np.random.randint(0, img.size[0] - w + 1)</span><br><span class="line">    j &#x3D; np.random.randint(0, img.size[1] - h + 1)</span><br><span class="line"></span><br><span class="line">    img &#x3D; img.crop((i, j, i + w, j + h))</span><br><span class="line">    img &#x3D; img.resize((train_parameters[&#39;input_size&#39;][1], train_parameters[&#39;input_size&#39;][2]), Image.BILINEAR)</span><br><span class="line">    return img</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def rotate_image(img):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    图像增强，增加随机旋转角度</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    angle &#x3D; np.random.randint(-14, 15)</span><br><span class="line">    img &#x3D; img.rotate(angle)</span><br><span class="line">    return img</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def random_brightness(img):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    图像增强，亮度调整</span><br><span class="line">    :param img:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    prob &#x3D; np.random.uniform(0, 1)</span><br><span class="line">    if prob &lt; train_parameters[&#39;image_enhance_strategy&#39;][&#39;brightness_prob&#39;]:</span><br><span class="line">        brightness_delta &#x3D; train_parameters[&#39;image_enhance_strategy&#39;][&#39;brightness_delta&#39;]</span><br><span class="line">        delta &#x3D; np.random.uniform(-brightness_delta, brightness_delta) + 1</span><br><span class="line">        img &#x3D; ImageEnhance.Brightness(img).enhance(delta)</span><br><span class="line">    return img</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def random_contrast(img):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    图像增强，对比度调整</span><br><span class="line">    :param img:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    prob &#x3D; np.random.uniform(0, 1)</span><br><span class="line">    if prob &lt; train_parameters[&#39;image_enhance_strategy&#39;][&#39;contrast_prob&#39;]:</span><br><span class="line">        contrast_delta &#x3D; train_parameters[&#39;image_enhance_strategy&#39;][&#39;contrast_delta&#39;]</span><br><span class="line">        delta &#x3D; np.random.uniform(-contrast_delta, contrast_delta) + 1</span><br><span class="line">        img &#x3D; ImageEnhance.Contrast(img).enhance(delta)</span><br><span class="line">    return img</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def random_saturation(img):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    图像增强，饱和度调整</span><br><span class="line">    :param img:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    prob &#x3D; np.random.uniform(0, 1)</span><br><span class="line">    if prob &lt; train_parameters[&#39;image_enhance_strategy&#39;][&#39;saturation_prob&#39;]:</span><br><span class="line">        saturation_delta &#x3D; train_parameters[&#39;image_enhance_strategy&#39;][&#39;saturation_delta&#39;]</span><br><span class="line">        delta &#x3D; np.random.uniform(-saturation_delta, saturation_delta) + 1</span><br><span class="line">        img &#x3D; ImageEnhance.Color(img).enhance(delta)</span><br><span class="line">    return img</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def random_hue(img):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    图像增强，色度调整</span><br><span class="line">    :param img:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    prob &#x3D; np.random.uniform(0, 1)</span><br><span class="line">    if prob &lt; train_parameters[&#39;image_enhance_strategy&#39;][&#39;hue_prob&#39;]:</span><br><span class="line">        hue_delta &#x3D; train_parameters[&#39;image_enhance_strategy&#39;][&#39;hue_delta&#39;]</span><br><span class="line">        delta &#x3D; np.random.uniform(-hue_delta, hue_delta)</span><br><span class="line">        img_hsv &#x3D; np.array(img.convert(&#39;HSV&#39;))</span><br><span class="line">        img_hsv[:, :, 0] &#x3D; img_hsv[:, :, 0] + delta</span><br><span class="line">        img &#x3D; Image.fromarray(img_hsv, mode&#x3D;&#39;HSV&#39;).convert(&#39;RGB&#39;)</span><br><span class="line">    return img</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def distort_color(img):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    概率的图像增强</span><br><span class="line">    :param img:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    prob &#x3D; np.random.uniform(0, 1)</span><br><span class="line">    # Apply different distort order</span><br><span class="line">    if prob &lt; 0.35:</span><br><span class="line">        img &#x3D; random_brightness(img)</span><br><span class="line">        img &#x3D; random_contrast(img)</span><br><span class="line">        img &#x3D; random_saturation(img)</span><br><span class="line">        img &#x3D; random_hue(img)</span><br><span class="line">    elif prob &lt; 0.7:</span><br><span class="line">        img &#x3D; random_brightness(img)</span><br><span class="line">        img &#x3D; random_saturation(img)</span><br><span class="line">        img &#x3D; random_hue(img)</span><br><span class="line">        img &#x3D; random_contrast(img)</span><br><span class="line">    return img</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line"># 数据增强策略：</span><br><span class="line"></span><br><span class="line"># 1、在线模式--训练中</span><br><span class="line"># 随机裁剪(完全随机，四个角+中心)  crop</span><br><span class="line"></span><br><span class="line">def random_crop(img, scale&#x3D;[0.8, 1.0], ratio&#x3D;[3. &#x2F; 4., 4. &#x2F; 3.], resize_w&#x3D;100, resize_h&#x3D;100):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    随机裁剪</span><br><span class="line">    :param img:</span><br><span class="line">    :param scale: 缩放</span><br><span class="line">    :param ratio:</span><br><span class="line">    :param resize_w:</span><br><span class="line">    :param resize_h:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    aspect_ratio &#x3D; math.sqrt(np.random.uniform(*ratio))</span><br><span class="line">    w &#x3D; 1. * aspect_ratio</span><br><span class="line">    h &#x3D; 1. &#x2F; aspect_ratio</span><br><span class="line">    src_h, src_w &#x3D; img.shape[:2]</span><br><span class="line"> </span><br><span class="line">    bound &#x3D; min((float(src_w) &#x2F; src_h) &#x2F; (w ** 2),</span><br><span class="line">                (float(src_h) &#x2F; src_w) &#x2F; (h ** 2))</span><br><span class="line">    scale_max &#x3D; min(scale[1], bound)</span><br><span class="line">    scale_min &#x3D; min(scale[0], bound)</span><br><span class="line"> </span><br><span class="line">    target_area &#x3D; src_h * src_w * np.random.uniform(scale_min, scale_max)</span><br><span class="line">    target_size &#x3D; math.sqrt(target_area)</span><br><span class="line">    w &#x3D; int(target_size * w)</span><br><span class="line">    h &#x3D; int(target_size * h)</span><br><span class="line"> </span><br><span class="line">    i &#x3D; np.random.randint(0, src_w - w + 1)</span><br><span class="line">    j &#x3D; np.random.randint(0, src_h - h + 1)</span><br><span class="line"> </span><br><span class="line">    img &#x3D; img[j:j + h, i:i + w]</span><br><span class="line">    img &#x3D; cv2.resize(img, (resize_w, resize_h))</span><br><span class="line">    return img</span><br><span class="line"> </span><br><span class="line"> </span><br><span class="line">def rule_crop(img, box_ratio&#x3D;(3. &#x2F; 4, 3. &#x2F; 4), location_type&#x3D;&#39;LT&#39;, resize_w&#x3D;100, resize_h&#x3D;100):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    按照一定规则进行裁剪, 直接在原图尺寸上操作，不对原图进行</span><br><span class="line">    :param img:</span><br><span class="line">    :param box_ratio: 剪切的 比例：  （宽度上的比例， 高度上的比例）</span><br><span class="line">    :param location_type: 具体在&#x3D;哪个位置： 以下其中一个：</span><br><span class="line">        LR : 左上角</span><br><span class="line">        RT : 右上角</span><br><span class="line">        LB : 左下角</span><br><span class="line">        RB : 右下角</span><br><span class="line">        CC : 中心</span><br><span class="line">    :param resize_w: 输出图的width</span><br><span class="line">    :param resize_h: 输出图的height</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    assert location_type in (&#39;LT&#39;, &#39;RT&#39;, &#39;LB&#39;, &#39;RB&#39;, &#39;CC&#39;), &#39;must have a location .&#39;</span><br><span class="line">    is_gray &#x3D; False</span><br><span class="line">    if len(img.shape) &#x3D;&#x3D; 3:</span><br><span class="line">        h, w, c &#x3D; img.shape</span><br><span class="line">    elif len(img.shape) &#x3D;&#x3D; 2:</span><br><span class="line">        h, w &#x3D; img.shape</span><br><span class="line">        is_gray &#x3D; True</span><br><span class="line"> </span><br><span class="line">    crop_w, crop_h &#x3D; int(w * box_ratio[0]), int(h * box_ratio[1])</span><br><span class="line">    crop_img &#x3D; np.zeros([10, 10])</span><br><span class="line">    if location_type &#x3D;&#x3D; &#39;LT&#39;:</span><br><span class="line">        crop_img &#x3D; img[:crop_h, :crop_w, :] if not is_gray else img[:crop_h, :crop_w]</span><br><span class="line">    elif location_type &#x3D;&#x3D; &#39;RT&#39;:</span><br><span class="line">        crop_img &#x3D; img[:crop_h:, w - crop_w:, :] if not is_gray else img[:crop_h:, w - crop_w:]</span><br><span class="line">    elif location_type &#x3D;&#x3D; &#39;LB&#39;:</span><br><span class="line">        crop_img &#x3D; img[h - crop_h:, :crop_w, :] if not is_gray else img[h - crop_h:, :crop_w]</span><br><span class="line">    elif location_type &#x3D;&#x3D; &#39;RB&#39;:</span><br><span class="line">        crop_img &#x3D; img[h - crop_h:, w - crop_w:, :] if not is_gray else img[h - crop_h:, w - crop_w:]</span><br><span class="line">    elif location_type &#x3D;&#x3D; &#39;CC&#39;:</span><br><span class="line">        start_h &#x3D; (h - crop_h) &#x2F;&#x2F; 2</span><br><span class="line">        start_w &#x3D; (w - crop_w) &#x2F;&#x2F; 2</span><br><span class="line">        crop_img &#x3D; img[start_h:start_h + crop_h, start_w:start_w + crop_w, :] if not is_gray else img[</span><br><span class="line">                                                                                                    start_h:start_h + crop_h,</span><br><span class="line">                                                                                                    start_w:start_w + crop_w]</span><br><span class="line"> </span><br><span class="line">    resize &#x3D; cv2.resize(crop_img, (resize_w, resize_h))</span><br><span class="line">    return resize</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 水平翻转  flip</span><br><span class="line">def random_flip(img, mode&#x3D;1):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    随机翻转</span><br><span class="line">    :param img:</span><br><span class="line">    :param model: 1&#x3D;水平翻转 &#x2F; 0&#x3D;垂直 &#x2F; -1&#x3D;水平垂直</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    assert mode in (0, 1, -1), &quot;mode is not right&quot;</span><br><span class="line">    flip &#x3D; np.random.choice(2) * 2 - 1  # -1 &#x2F; 1</span><br><span class="line">    if mode &#x3D;&#x3D; 1:</span><br><span class="line">        img &#x3D; img[:, ::flip, :]</span><br><span class="line">    elif mode &#x3D;&#x3D; 0:</span><br><span class="line">        img &#x3D; img[::flip, :, :]</span><br><span class="line">    elif mode &#x3D;&#x3D; -1:</span><br><span class="line">        img &#x3D; img[::flip, ::flip, :]</span><br><span class="line"> </span><br><span class="line">    return img</span><br><span class="line"> </span><br><span class="line"> </span><br><span class="line">def flip(img, mode&#x3D;1):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    翻转</span><br><span class="line">    :param img:</span><br><span class="line">    :param mode: 1&#x3D;水平翻转 &#x2F; 0&#x3D;垂直 &#x2F; -1&#x3D;水平垂直</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    assert mode in (0, 1, -1), &quot;mode is not right&quot;</span><br><span class="line">    return cv2.flip(img, flipCode&#x3D;mode)</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 随机锐化增强</span><br><span class="line">def random_USM(img, gamma&#x3D;0.):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    USM锐化增强算法可以去除一些细小的干扰细节和图像噪声，比一般直接使用卷积锐化算子得到的图像更可靠。</span><br><span class="line">        output &#x3D; 原图像−w∗高斯滤波(原图像)&#x2F;(1−w)</span><br><span class="line">        其中w为上面所述的系数，取值范围为0.1~0.9，一般取0.6。</span><br><span class="line">    :param img:</span><br><span class="line">    :param gamma:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    blur &#x3D; cv2.GaussianBlur(img, (0, 0), 25)</span><br><span class="line">    img_sharp &#x3D; cv2.addWeighted(img, 1.5, blur, -0.3, gamma)</span><br><span class="line">    return img_sharp</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 2 离线模式</span><br><span class="line"># 2.1 随机扰动</span><br><span class="line"></span><br><span class="line"># 噪声(高斯、自定义)  noise</span><br><span class="line">def random_noise(img, rand_range&#x3D;(3, 20)):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    随机噪声</span><br><span class="line">    :param img:</span><br><span class="line">    :param rand_range: (min, max)</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    img &#x3D; np.asarray(img, np.float)</span><br><span class="line">    sigma &#x3D; random.randint(*rand_range)</span><br><span class="line">    nosie &#x3D; np.random.normal(0, sigma, size&#x3D;img.shape)</span><br><span class="line">    img +&#x3D; nosie</span><br><span class="line">    img &#x3D; np.uint8(np.clip(img, 0, 255))</span><br><span class="line">    return img</span><br><span class="line"> </span><br><span class="line"></span><br><span class="line"># 滤波(高斯、平滑、均值、中值、最大最小值、双边、引导、运动)</span><br><span class="line"># 各种滤波原理介绍：https:&#x2F;&#x2F;blog.csdn.net&#x2F;hellocsz&#x2F;article&#x2F;details&#x2F;80727972</span><br><span class="line">def gaussianBlue(img, ks&#x3D;(7, 7), stdev&#x3D;1.5):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    高斯模糊, 可以对图像进行平滑处理，去除尖锐噪声</span><br><span class="line">    :param img:</span><br><span class="line">    :param ks:  卷积核</span><br><span class="line">    :param stdev: 标准差</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    return cv2.GaussianBlur(img, (7, 7), 1.5)</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 随机滤波</span><br><span class="line">def ranndom_blur(img, ksize&#x3D;(3, 3)):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    随机滤波</span><br><span class="line">    :param img:</span><br><span class="line">    :param ksize:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    blur_types &#x3D; [&#39;gaussian&#39;, &#39;median&#39;, &#39;bilateral&#39;, &#39;mean&#39;, &#39;box&#39;]</span><br><span class="line">    assert len(blur_types) &gt; 0</span><br><span class="line">    blur_func &#x3D; None</span><br><span class="line">    blur_index &#x3D; random.choice(blur_types)</span><br><span class="line">    if blur_index &#x3D;&#x3D; 0:  # 高斯模糊, 比均值滤波更平滑，边界保留更加好</span><br><span class="line">        blur_func &#x3D; cv2.GaussianBlur</span><br><span class="line">    elif blur_index &#x3D;&#x3D; 1:  # 中值滤波, 在边界保存方面好于均值滤波，但在模板变大的时候会存在一些边界的模糊。对于椒盐噪声有效</span><br><span class="line">        blur_func &#x3D; cv2.medianBlur</span><br><span class="line">    elif blur_index &#x3D;&#x3D; 2:  # 双边滤波, 非线性滤波，保留较多的高频信息，不能干净的过滤高频噪声，对于低频滤波较好，不能去除脉冲噪声</span><br><span class="line">        blur_func &#x3D; cv2.bilateralFilter</span><br><span class="line">    elif blur_index &#x3D;&#x3D; 3:  # 均值滤波, 在去噪的同时去除了很多细节部分，将图像变得模糊</span><br><span class="line">        blur_func &#x3D; cv2.blur</span><br><span class="line">    elif blur_index &#x3D;&#x3D; 4:  # 盒滤波器</span><br><span class="line">        blur_func &#x3D; cv2.boxFilter</span><br><span class="line"> </span><br><span class="line">    img_blur &#x3D; blur_func(src&#x3D;img, ksize&#x3D;ksize)</span><br><span class="line">    return img_blur</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 直方图均衡化</span><br><span class="line">def equalize_hist(img):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    直方图均衡化</span><br><span class="line">    :param img:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    gray &#x3D; cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)</span><br><span class="line">    hist &#x3D; cv2.equalizeHist(gray)</span><br><span class="line">    rgb &#x3D; cv2.cvtColor(hist, cv2.COLOR_GRAY2RGB)</span><br><span class="line">    return rgb</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 2.2 转换</span><br><span class="line"># 旋转  rorate</span><br><span class="line">def rotate(img, angle, scale&#x3D;1.0):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    旋转</span><br><span class="line">    :param img:</span><br><span class="line">    :param angle: 旋转角度， &gt;0 表示逆时针，</span><br><span class="line">    :param scale:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    height, width &#x3D; img.shape[:2]  # 获取图像的高和宽</span><br><span class="line">    center &#x3D; (width &#x2F; 2, height &#x2F; 2)  # 取图像的中点</span><br><span class="line"> </span><br><span class="line">    M &#x3D; cv2.getRotationMatrix2D(center, angle, scale)  # 获得图像绕着某一点的旋转矩阵</span><br><span class="line">    # cv2.warpAffine()的第二个参数是变换矩阵,第三个参数是输出图像的大小</span><br><span class="line">    rotated &#x3D; cv2.warpAffine(img, M, (height, width))</span><br><span class="line">    return rotated</span><br><span class="line"> </span><br><span class="line"> </span><br><span class="line">def random_rotate(img, angle_range&#x3D;(-10, 10)):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    随机旋转</span><br><span class="line">    :param img:</span><br><span class="line">    :param angle_range:  旋转角度范围 (min,max)   &gt;0 表示逆时针，</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    height, width &#x3D; img.shape[:2]  # 获取图像的高和宽</span><br><span class="line">    center &#x3D; (width &#x2F; 2, height &#x2F; 2)  # 取图像的中点</span><br><span class="line">    angle &#x3D; random.randrange(*angle_range, 1)</span><br><span class="line">    M &#x3D; cv2.getRotationMatrix2D(center, angle, 1.0)  # 获得图像绕着某一点的旋转矩阵</span><br><span class="line">    # cv2.warpAffine()的第二个参数是变换矩阵,第三个参数是输出图像的大小</span><br><span class="line">    rotated &#x3D; cv2.warpAffine(img, M, (height, width))</span><br><span class="line">    return rotated</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 偏移  shift</span><br><span class="line">def shift(img, x_offset, y_offset):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    偏移，向右 向下</span><br><span class="line">    :param img:</span><br><span class="line">    :param x_offset:  &gt;0表示向右偏移px, &lt;0表示向左</span><br><span class="line">    :param y_offset:  &gt;0表示向下偏移px, &lt;0表示向上</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    h, w, _ &#x3D; img.shape</span><br><span class="line">    M &#x3D; np.array([[1, 0, x_offset], [0, 1, y_offset]], dtype&#x3D;np.float)</span><br><span class="line">    return cv2.warpAffine(img, M, (w, h))</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 倾斜  skew</span><br><span class="line"># ...</span><br><span class="line"># 缩放  scale</span><br><span class="line">def resize_img(img, resize_w, resize_h):</span><br><span class="line">    height, width &#x3D; img.shape[:2]  # 获取图片的高和宽</span><br><span class="line">    return cv2.resize(img, (resize_w, resize_h), interpolation&#x3D;cv2.INTER_CUBIC)</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># RGB&#x2F;BGR-&gt;HSV</span><br><span class="line">def rgb2hsv_py(r, g, b):</span><br><span class="line">    # from https:&#x2F;&#x2F;blog.csdn.net&#x2F;weixin_43360384&#x2F;article&#x2F;details&#x2F;84871521</span><br><span class="line">    r, g, b &#x3D; r&#x2F;255.0, g&#x2F;255.0, b&#x2F;255.0</span><br><span class="line">    mx &#x3D; max(r, g, b)</span><br><span class="line">    mn &#x3D; min(r, g, b)</span><br><span class="line">    m &#x3D; mx-mn</span><br><span class="line">    if mx &#x3D;&#x3D; mn:</span><br><span class="line">        h &#x3D; 0</span><br><span class="line">    elif mx &#x3D;&#x3D; r:</span><br><span class="line">        if g &gt;&#x3D; b:</span><br><span class="line">            h &#x3D; ((g-b)&#x2F;m)*60</span><br><span class="line">        else:</span><br><span class="line">            h &#x3D; ((g-b)&#x2F;m)*60 + 360</span><br><span class="line">    elif mx &#x3D;&#x3D; g:</span><br><span class="line">        h &#x3D; ((b-r)&#x2F;m)*60 + 120</span><br><span class="line">    elif mx &#x3D;&#x3D; b:</span><br><span class="line">        h &#x3D; ((r-g)&#x2F;m)*60 + 240</span><br><span class="line">    elif mx &#x3D;&#x3D; 0:</span><br><span class="line">        s &#x3D; 0</span><br><span class="line">    else:</span><br><span class="line">        s &#x3D; m&#x2F;mx</span><br><span class="line">    v &#x3D; mx</span><br><span class="line">    return h, s, v</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def rgb2hsv_cv(img):</span><br><span class="line">    # from https:&#x2F;&#x2F;blog.csdn.net&#x2F;qq_38332453&#x2F;article&#x2F;details&#x2F;89258058</span><br><span class="line">    h &#x3D; img.shape[0]</span><br><span class="line">    w &#x3D; img.shape[1]</span><br><span class="line">    H &#x3D; np.zeros((h,w),np.float32)</span><br><span class="line">    S &#x3D; np.zeros((h, w), np.float32)</span><br><span class="line">    V &#x3D; np.zeros((h, w), np.float32)</span><br><span class="line">    r,g,b &#x3D; cv2.split(img)</span><br><span class="line">    r, g, b &#x3D; r&#x2F;255.0, g&#x2F;255.0, b&#x2F;255.0</span><br><span class="line">    for i in range(0, h):</span><br><span class="line">        for j in range(0, w):</span><br><span class="line">            mx &#x3D; max((b[i, j], g[i, j], r[i, j]))</span><br><span class="line">            mn &#x3D; min((b[i, j], g[i, j], r[i, j]))</span><br><span class="line">            V[i, j] &#x3D; mx</span><br><span class="line">            if V[i, j] &#x3D;&#x3D; 0:</span><br><span class="line">                S[i, j] &#x3D; 0</span><br><span class="line">            else:</span><br><span class="line">                S[i, j] &#x3D; (V[i, j] - mn) &#x2F; V[i, j]</span><br><span class="line">            if mx &#x3D;&#x3D; mn:</span><br><span class="line">                H[i, j] &#x3D; 0</span><br><span class="line">            elif V[i, j] &#x3D;&#x3D; r[i, j]:</span><br><span class="line">                if g[i, j] &gt;&#x3D; b[i, j]:</span><br><span class="line">                    H[i, j] &#x3D; (60 * ((g[i, j]) - b[i, j]) &#x2F; (V[i, j] - mn))</span><br><span class="line">                else:</span><br><span class="line">                    H[i, j] &#x3D; (60 * ((g[i, j]) - b[i, j]) &#x2F; (V[i, j] - mn))+360</span><br><span class="line">            elif V[i, j] &#x3D;&#x3D; g[i, j]:</span><br><span class="line">                H[i, j] &#x3D; 60 * ((b[i, j]) - r[i, j]) &#x2F; (V[i, j] - mn) + 120</span><br><span class="line">            elif V[i, j] &#x3D;&#x3D; b[i, j]:</span><br><span class="line">                H[i, j] &#x3D; 60 * ((r[i, j]) - g[i, j]) &#x2F; (V[i, j] - mn) + 240</span><br><span class="line">            H[i,j] &#x3D; H[i,j] &#x2F; 2</span><br><span class="line">    return H, S, V</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 图片叠加与融合</span><br><span class="line">def addWeight(src1, alpha, src2, beta, gamma):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    g (x) &#x3D; (1 − α)f0 (x) + αf1 (x)   #a→（0，1）不同的a值可以实现不同的效果</span><br><span class="line">    dst &#x3D; src1 * alpha + src2 * beta + gamma</span><br><span class="line">    :param src1: img1</span><br><span class="line">    :param alpha:</span><br><span class="line">    :param src2: img2</span><br><span class="line">    :param beta:</span><br><span class="line">    :param gamma:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    assert src1.shap &#x3D;&#x3D; src2.shape</span><br><span class="line">    return cv2.addWeighted(src1, alpha, src2, beta, gamma)</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># 颜色抖动(亮度\色度\饱和度\对比度)  color jitter</span><br><span class="line">def adjust_contrast_bright(img, contrast&#x3D;1.2, brightness&#x3D;100):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    调整亮度与对比度</span><br><span class="line">    dst &#x3D; img * contrast + brightness</span><br><span class="line">    :param img:</span><br><span class="line">    :param contrast: 对比度   越大越亮</span><br><span class="line">    :param brightness: 亮度  0~100</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    # 像素值会超过0-255， 因此需要截断</span><br><span class="line">    return np.uint8(np.clip((contrast * img + brightness), 0, 255))</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">def pytorch_color_jitter(img):</span><br><span class="line">    return torchvision.transforms.ColorJitter(brightness&#x3D;0, contrast&#x3D;0, saturation&#x3D;0, hue&#x3D;0)</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># gamma 变换</span><br><span class="line">def gamma_transform(img, gamma&#x3D;1.0):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    https:&#x2F;&#x2F;blog.csdn.net&#x2F;zfjBIT&#x2F;article&#x2F;details&#x2F;85113946</span><br><span class="line">    伽马变换就是用来图像增强，其提升了暗部细节，简单来说就是通过非线性变换，</span><br><span class="line">    让图像从暴光强度的线性响应变得更接近人眼感受的响应，即将漂白（相机曝光）或过暗（曝光不足）的图片，进行矫正</span><br><span class="line">    :param img:</span><br><span class="line">    :param gamma:</span><br><span class="line">        # gamma &#x3D; random.random() * random.choice([0.5, 1, 3, 5])</span><br><span class="line">        &gt;1, 变暗</span><br><span class="line">        &lt;1, 漂白</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    assert 0 &lt; gamma &lt; 25.</span><br><span class="line">    # 具体做法先归一化到1，然后gamma作为指数值求出新的像素值再还原</span><br><span class="line">    gamma_table &#x3D; [np.power(x &#x2F; 255.0, gamma) * 255.0 for x in range(256)]</span><br><span class="line">    gamma_table &#x3D; np.round(np.array(gamma_table)).astype(np.uint8)</span><br><span class="line">    # 实现映射用的是Opencv的查表函数</span><br><span class="line">    return cv2.LUT(img, gamma_table)</span><br><span class="line"></span><br><span class="line"></span><br><span class="line"># mix up 图片混合</span><br><span class="line">def mixup(batch_x, batch_y, alpha):</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    Returns mixed inputs, pairs of targets, and lambda</span><br><span class="line">    :param batch_x:</span><br><span class="line">    :param batch_y:</span><br><span class="line">    :param alpha:</span><br><span class="line">    :return:</span><br><span class="line">    &quot;&quot;&quot;</span><br><span class="line">    if alpha &gt; 0:</span><br><span class="line">        lam &#x3D; np.random.beta(alpha, alpha)</span><br><span class="line">    else:</span><br><span class="line">        lam &#x3D; 1</span><br><span class="line"> </span><br><span class="line">    batch_size &#x3D; batch_x.shape[0]</span><br><span class="line">    index &#x3D; [i for i in range(batch_size)]</span><br><span class="line">    random.shuffle(index)</span><br><span class="line"> </span><br><span class="line">    mixed_x &#x3D; lam * batch_x + (1 - lam) * batch_x[index, :]</span><br><span class="line">    y_a, y_b &#x3D; batch_y, batch_y[index]</span><br><span class="line">    return mixed_x, y_a, y_b, lam</span><br></pre></td></tr></table></figure>]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>数据增强</tag>
+        <tag>Data Augmentation</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>数据结构的存储方式和基本操作</title>
+    <url>/blog/2020/07/22/%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E7%9A%84%E5%AD%98%E5%82%A8%E6%96%B9%E5%BC%8F%E5%92%8C%E5%9F%BA%E6%9C%AC%E6%93%8D%E4%BD%9C/</url>
+    <content><![CDATA[<h3 id="1、数据结构的存储方式"><a href="#1、数据结构的存储方式" class="headerlink" title="1、数据结构的存储方式"></a>1、数据结构的存储方式</h3><p><strong>数据结构的存储方式概括只有两种：数组（顺序存储）和链表（链式存储）</strong></p>
+<p>那么散列表、栈、队列、堆、树、图等等各种数据结构是什么呢？</p>
+<p>我们分析问题，一定要有递归的思想，自顶向下，从抽象到具体。散列表、栈、队列、堆、树、图等属于上层建筑，而数组和链表才是结构基础。这些多样化的数据结构，都是在链表或者数组上的特殊操作，API不同而已。</p>
+<p>比如队列、栈这两种数据结构既可以使用链表也可以使用数组实现。用数组实现，需要处理扩容缩容的问题；用链表实现，则没有这个问题，但需要更多的内存空间存储节点指针。</p>
+<p>图的两种表示方法，邻接表就是链表，邻接矩阵就是二维数组。邻接矩阵判断连通性，并可以进行矩阵运算解决一些问题，但是如果图比较稀疏的话就很耗费空间。邻接表比较节省空间，但是很多操作的效率上肯定比不过邻接矩阵。</p>
+<p>散列表就是通过散列函数把键映射到一个大数组里。而且对于解决散列冲突的方法，拉链法需要链表特性，操作简单，但需要额外的空间存储指针；线性探查法就需要数组特性，以便连续寻址，不需要指针的存储空间，但操作稍微复杂些。</p>
+<p>数，用数组实现就是堆，因为堆是一个完全二叉树，用数组存储不需要节点指针，操作也比较简单；用链表实现就是很常见的那种数，因为不一定是完全二叉树，所以不适合用数组存储。为此，在这种链表树结构之上，又衍生出各种巧妙的设计，比如二叉搜索树、AVL树、红黑树、区间树、B树等等，以应对不同的问题。</p>
+<p>了解Redis数据库的朋友可能也知道，Redis提供列表、字符串、集合等等几种常用数据结构，但是对于每种数据结构，底层的存储方式都至少有两种，以便根据存储数据的实际情况使用合适的存储方式。</p>
+<p>综上所述，数据结构种类很多，甚至你也可以发明自己的数据结构，但是底层存储无非数组或者链表，二者的优缺点如下：</p>
+<p>数组由于是紧凑连续存储，可以随机访问，通过索引快速找到对应元素，而且相对节约存储空间。但正因为连续存储，内存空间必须一次性分配够，所以说数组如果要扩容，需要重新分配一块更大的空间，再把数据全部复制过去，时间复杂度O(N)；而且如果你想在数组中间进行插入和删除，每次必须搬移后面的所有数据以保持连续，时间复杂度O(N)。</p>
+<p>链表因为元素不连续，而是靠指针指向下一个元素的位置，所以不存在数组扩容问题；如果知道某一元素的前驱和后驱，操作指针即可删除该元素或者插入新元素，时间复杂度O(1)。但是正因为存储空间不连续，你无法根据一个索引算出对应元素的地址，所有不能随机访问；而且由于每个元素必须存储指向前后元素位置的指针，会消耗相对更多的存储空间。</p>
+<h3 id="2、数据结构的基本操作"><a href="#2、数据结构的基本操作" class="headerlink" title="2、数据结构的基本操作"></a>2、数据结构的基本操作</h3><p>对于任何数据结构，其基本操作无非遍历+访问，再具体一点就是：增删改查。数据结构种类很多，但他们存在的目的都是在不同的应用场景下，尽可能高效地增删改查。</p>
+<p>如何遍历+访问？我们仍然从最高层来看，各种数据结构的遍历和访问无非两种形式：线性的和非线性的。</p>
+<p>线性的就是for/while迭代为代表，非线性就是递归为代表。再具体一步，无非以下几种框架：</p>
+<p>数组遍历框架，典型的线性迭代结构：</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">void traverse(int[] arr)</span><br><span class="line">&#123;</span><br><span class="line">    for (int i&#x3D;0; i&lt;arr.length; i++)</span><br><span class="line">    &#123;</span><br><span class="line">        &#x2F;&#x2F; 迭代访问arr[i]</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>链表遍历框架，兼具迭代和递归结构：</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">&#x2F;&#x2F; 基本的单链表节点</span><br><span class="line">class ListNode</span><br><span class="line">&#123;</span><br><span class="line">    int val;</span><br><span class="line">    ListNode next;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line">void traverse(ListNode head)</span><br><span class="line">&#123;</span><br><span class="line">    for (ListNode p&#x3D;head; p!&#x3D;null; p&#x3D;p.next)</span><br><span class="line">    &#123;</span><br><span class="line">        &#x2F;&#x2F; 迭代访问 p.val</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line">void traverse(ListNode head)</span><br><span class="line">&#123;</span><br><span class="line">    &#x2F;&#x2F; 递归访问 head.val</span><br><span class="line">    traverse(head.next);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>二叉树遍历框架，典型的非线性递归遍历结构：</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">&#x2F;&#x2F; 基本的二叉树节点</span><br><span class="line">class TreeNode</span><br><span class="line">&#123;</span><br><span class="line">    int val;</span><br><span class="line">    TreeNode left, right;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line">void traverse(TreeNode root)</span><br><span class="line">&#123;</span><br><span class="line">    traverse(root.left);</span><br><span class="line">    traverse(root.right);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>二叉树框架可以扩展为N叉树的遍历框架：</p>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">&#x2F;&#x2F; 基本的N叉树节点</span><br><span class="line">class TreeNode</span><br><span class="line">&#123;</span><br><span class="line">    int val;</span><br><span class="line">    TreeNode[] children;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line">void traverse(TreeNode root)</span><br><span class="line">&#123;</span><br><span class="line">    for (TreeNode child : root.children)</span><br><span class="line">    &#123;</span><br><span class="line">        traverse(child);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>N叉树的遍历又可以扩展为图的遍历，因为图就是好几个N叉树的结合体。你说图是可能出现环的？这个很好办，用个布尔数据visited做标记就可以了，这里就不写代码了。</p>
+<p>数据结构是工具，算法是通过合适的工具解决特定问题的方法。也就是说，学习算法之前，最起码得了解那些常用的数据结构，了解他们的特性和缺陷。</p>
+<h3 id="3、总结"><a href="#3、总结" class="headerlink" title="3、总结"></a>3、总结</h3><p>数据结构的基本存储方式就是链式和顺序两种，基本操作就是增删改查，遍历方式无非迭代和递归。</p>
+<p>刷算法题建议从树分类开始刷，结合框架思维，把这几十道题刷完，对于树结构的理解应该就到位了。这时候去看回溯、动规、分治等算法专题，对思路的理解可能会更加深刻一些。</p>
+]]></content>
+      <categories>
+        <category>linux</category>
+      </categories>
+      <tags>
+        <tag>数据结构</tag>
+        <tag>算法</tag>
+        <tag>LeetCode</tag>
+        <tag>存储方式</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>深度学习任务实践指南</title>
+    <url>/blog/2020/07/16/%E6%B7%B1%E5%BA%A6%E5%AD%A6%E4%B9%A0%E4%BB%BB%E5%8A%A1%E5%AE%9E%E8%B7%B5%E6%8C%87%E5%8D%97/</url>
+    <content><![CDATA[<h3 id="1、业务任务拆分"><a href="#1、业务任务拆分" class="headerlink" title="1、业务任务拆分"></a>1、业务任务拆分</h3><p>我们实际中面对的业务任务往往比较抽象，比如问答系统、对话系统等，如果针对问题直接解决问题，往往会导致时间、算力等成本的浪费。在深度学习模型0-1的阶段，我们的目标往往是快速搭建一个demo，确定优化方向。所以针对复杂的任务，我们需要将其抽象为已得到很好解决的典型问题，利用典型问题的预训练模型，快速搭建我们的业务base模型。</p>
+<h4 id="1-1、拆分依据"><a href="#1-1、拆分依据" class="headerlink" title="1.1、拆分依据"></a>1.1、拆分依据</h4><ul>
+<li>明确输入与输出</li>
+<li>熟知典型问题</li>
+<li>适当拆分</li>
+</ul>
+<h4 id="1-2、典型任务（NLP为例）"><a href="#1-2、典型任务（NLP为例）" class="headerlink" title="1.2、典型任务（NLP为例）"></a>1.2、典型任务（NLP为例）</h4><p><strong>文本分类</strong></p>
+<ul>
+<li>输入文本用X表示，输出标签用Y表示</li>
+<li>如果Y表示某一类的概率，或者各个类的概率分布，则可以抽象为文本分类问题。如情感分类任务、新闻主题分类任务、文本蕴含任务等。</li>
+</ul>
+<p><strong>文本匹配</strong></p>
+<ul>
+<li>输入文本用X表示，输出标签用Y表示</li>
+<li>如果X是2段文本(X1, X2)，Y表示二者的相似度，可抽象为文本匹配问题。如语义相似度、相似问题匹配等任务。</li>
+</ul>
+<p><em>PS：文本聚类的问题可以通过文本相似度问题进行处理</em></p>
+<p><strong>序列标注</strong></p>
+<ul>
+<li>输入文本用X表示，输出标签用Y表示</li>
+<li>如果X为一段文本序列，Y是一个与X等长的序列，可抽象为序列标注问题。如命名实体识别。</li>
+</ul>
+<p><em>PS：分词、词性标注、组块分析、语义角色标注、词槽挖掘都是典型的序列标注任务。阅读理解可以理解为特殊的序列标注，X是2段文本(X1, X2)，分别表示整篇文章和问题，Y是篇章中的一小段文本，表示对应问题的答案。</em></p>
+<p><strong>文本生成</strong></p>
+<ul>
+<li>输入文本用X表示，输出标签用Y表示</li>
+<li>如果X是一段文本序列，Y是一个不定长的文本，可抽象为文本生成问题。如机器翻译、文本摘要、标题生成、闲聊等任务。</li>
+</ul>
+<p><em>一个不太严谨的分类</em></p>
+<table>
+<thead>
+<tr>
+<th>文本分类</th>
+<th>文本匹配</th>
+<th>序列标注</th>
+<th>文本生成</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>情感分类</td>
+<td>问答匹配</td>
+<td>信息抽取</td>
+<td>机器翻译</td>
+</tr>
+<tr>
+<td>文本审核</td>
+<td>新闻聚类</td>
+<td>词性标注</td>
+<td>摘要生成</td>
+</tr>
+<tr>
+<td>意图识别</td>
+<td>querry匹配</td>
+<td>词槽填充</td>
+<td>标题生成</td>
+</tr>
+</tbody></table>
+<h4 id="1-3、抽象与拆分任务取舍经验"><a href="#1-3、抽象与拆分任务取舍经验" class="headerlink" title="1.3、抽象与拆分任务取舍经验"></a>1.3、抽象与拆分任务取舍经验</h4><p><strong>复杂任务先拆分先化简</strong></p>
+<p>例如：<br><strong>问答系统 = 实体链指 + 关系分类 + 逻辑表达式 + 问答匹配</strong><br><strong>对话系统 = 意图理解 + 聊天任务 + 问答任务 + 对话管理</strong></p>
+<p><strong>优先推荐有监督学习的深度学习任务</strong></p>
+<p>在任务选择上：<br><strong>有监督</strong> 优于 <strong>无监督</strong><br><strong>深度学习</strong> 优于 <strong>非深度学习</strong></p>
+<p>例如：<br>文本关键词抽取：可以用TF IDF之类的无监督算法，但效果控制较困难，不如转换为文本分类问题，更可控。<br>文本聚类问题： 可以用LDA之类的算法，但效果不够好，不如转换为深度学习文本匹配问题，效果更好，并可不断改进。</p>
+<h3 id="2、如何进行技术选型"><a href="#2、如何进行技术选型" class="headerlink" title="2、如何进行技术选型"></a>2、如何进行技术选型</h3><h4 id="2-1、明确业务目标与限制条件"><a href="#2-1、明确业务目标与限制条件" class="headerlink" title="2.1、明确业务目标与限制条件"></a>2.1、明确业务目标与限制条件</h4><table>
+<thead>
+<tr>
+<th>目标与限制</th>
+<th>典型指标</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>预测部署性能</td>
+<td>单机QPS</td>
+<td>CPU/GPU不同</td>
+</tr>
+<tr>
+<td>模型效果</td>
+<td>分类：准确率、精确率、召回率、宏平均、微平均等</td>
+<td>评估指标应在训练之前基本确定，否则很容易训偏</td>
+</tr>
+<tr>
+<td>数据大小限制</td>
+<td>有标注样本数</td>
+<td>一般标注成本较高</td>
+</tr>
+<tr>
+<td>训练时间成本</td>
+<td>每一轮训练所需要的时间</td>
+<td>与硬件条件、GPU利用率相关</td>
+</tr>
+<tr>
+<td>硬件采购成本</td>
+<td>价格、租金</td>
+<td>训练与预测部署不同</td>
+</tr>
+<tr>
+<td>开发迭代成本</td>
+<td>从0到1的时间，从1到2的时间</td>
+<td>非常耗时、学习时间也是成本</td>
+</tr>
+</tbody></table>
+<p>例如：</p>
+<table>
+<thead>
+<tr>
+<th>目标与限制</th>
+<th>以搜索问答为例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>预测部署性能</td>
+<td>CPU单机QPS：1000+</td>
+</tr>
+<tr>
+<td>模型效果</td>
+<td>分类+匹配：保证精确率前提下的召回率</td>
+</tr>
+<tr>
+<td>数据大小限制</td>
+<td>人工标注样本：10万+</td>
+</tr>
+<tr>
+<td>训练时间成本</td>
+<td>每一轮训练所需时间：1天之内</td>
+</tr>
+<tr>
+<td>硬件采购成本</td>
+<td>基于已有GPU训练平台，不新增采购</td>
+</tr>
+<tr>
+<td>开发迭代成本</td>
+<td>从1到2：一个月之内</td>
+</tr>
+</tbody></table>
+<h4 id="2-2、可以进行哪些选择"><a href="#2-2、可以进行哪些选择" class="headerlink" title="2.2、可以进行哪些选择"></a>2.2、可以进行哪些选择</h4><table>
+<thead>
+<tr>
+<th>技术选项</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>开发工具</td>
+<td>一站式训练平台、无代码训练工具、训练开发套件、深度学习框架</td>
+</tr>
+<tr>
+<td>训练硬件</td>
+<td>GPU（型号、卡数、节点数），CPU（节点数），本地or集群</td>
+</tr>
+<tr>
+<td>神经网络及其参数</td>
+<td>预制网络（BOW、CNN、LSTM、CRF、ERNIE），自建网络</td>
+</tr>
+<tr>
+<td>预训练模型</td>
+<td>ERNIE（版本号、BASE、LARGE），领域模型、任务模型、随机初始</td>
+</tr>
+<tr>
+<td>训练数据大小</td>
+<td>1000+,1万+，10万+，100万+，1千万+，1亿+</td>
+</tr>
+<tr>
+<td>训练数据特征</td>
+<td>文本特征（多段？）、离散非文本特征、连续数值特征</td>
+</tr>
+</tbody></table>
+<h4 id="2-3、选择方法"><a href="#2-3、选择方法" class="headerlink" title="2.3、选择方法"></a>2.3、选择方法</h4><p><strong>基于预测部署性能</strong></p>
+<p>例如：搜索问答场景</p>
+<p>定性分析：</p>
+<table>
+<thead>
+<tr>
+<th>要求</th>
+<th>选择</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>qps&gt;1000</td>
+<td>一般不适合直接应用ERNIE、ERNIE-TINY；可尝试模型蒸馏（模型效果有一定损失）；也可尝试ERNIE-WORD</td>
+</tr>
+<tr>
+<td>qps&gt;100</td>
+<td>推荐尝试ERNIE-TINY等轻量级加速版模型；预测用GPU可配置低些以降低成本；GPU加速推断策略正在不断完善</td>
+</tr>
+<tr>
+<td>无强制要求</td>
+<td>大胆尝试各种预训练模型</td>
+</tr>
+</tbody></table>
+<p>所以搜索问答场景适合模型蒸馏的技术方案</p>
+<p><strong>基于模型效果</strong></p>
+<p>通常：</p>
+<p><strong>有预训练模型</strong> 优于 <strong>无预训练模型</strong><br><strong>多样特征</strong> 优于 <strong>单一特征</strong><br><strong>ERNIE-LARGE</strong> 优于 <strong>ERNIE-BASE</strong> 优于 <strong>ERNIE-TINY</strong> 优于 <strong>ERNIE-WORD</strong><br><strong>ERNIE新版本</strong> 优于 <strong>ERNIE旧版本</strong><br><strong>垂类模型</strong> 优于 <strong>通用模型</strong><br><strong>大数据</strong> 优于 <strong>小数据</strong><br><strong>标注数据质量</strong> 优于 <strong>标注数据数量</strong><br><strong>复杂网络</strong> 优于 <strong>简单网络</strong><br><strong>多阶段训练</strong> 优于 <strong>单阶段训练</strong></p>
+<h3 id="3、如何提升训练效率（怎么用好GPU）"><a href="#3、如何提升训练效率（怎么用好GPU）" class="headerlink" title="3、如何提升训练效率（怎么用好GPU）"></a>3、如何提升训练效率（怎么用好GPU）</h3><ul>
+<li><p><strong>大原则</strong><br>GPU利用率越高，训练越快。</p>
+</li>
+<li><p><strong>先小后大</strong><br>先单机单卡，再单机多卡，最后多级多卡；单机多卡的GPU利用率更高、更快。</p>
+</li>
+<li><p><strong>文件数要大于卡数</strong><br>多卡训练时是将不同的数据文件送给不同的卡，所以数据文件的个数要大于卡的个数；数据文件建议拆分细一些，这可以提升数据读取的速度。</p>
+</li>
+<li><p><strong>高级玩法</strong><br>熟练的同学可以尝试GPU多进程单机多卡训练，混合精度训练等方法，提升训练速度。</p>
+</li>
+<li><p><strong>train_log_step、eval_step、save_model_step</strong><br>分别表示每多少步打印训练日志、每多少步评估一次验证集、每多少步保存一次模型，设置不当也会拖慢训练时间，一般建议三者依次放大十倍，如：10、100、1000</p>
+</li>
+<li><p><strong>batch_size</strong><br>设置过小容易收敛慢，设置过大容易超过显存极限直接挂掉；如果使用ERNIE，batch_size建议小一些，使用large版本建议更小一些，如果输入语句并不是很长，可以适当增加batch_size；如果不使用ERNIE，可以大一些；建议使用默认配置，如果想优化可以采用二分查找。</p>
+</li>
+</ul>
+<h3 id="4、如何提升迭代效率"><a href="#4、如何提升迭代效率" class="headerlink" title="4、如何提升迭代效率"></a>4、如何提升迭代效率</h3><h4 id="4-1、云端开发-VS-本地开发"><a href="#4-1、云端开发-VS-本地开发" class="headerlink" title="4.1、云端开发 VS 本地开发"></a>4.1、云端开发 VS 本地开发</h4><p><strong>如果只想快速训练基线模型验证效果</strong></p>
+<ul>
+<li>建议使用EasyDL、BML等云端平台</li>
+<li>免去前期搭建环境的成本，减少从0到1的开发时间</li>
+</ul>
+<p><strong>如果需要不断调试、迭代优化模型</strong></p>
+<ul>
+<li>如果有条件建议本地调试+云端训练的方式，减少从1到2的开发时间</li>
+<li>本地调试：减少网络传输和任务队列排队的时间</li>
+<li>云端训练：充分利用云端集群资源</li>
+<li>工具版本地调试成功后再上集群训练能极大提升迭代效率</li>
+</ul>
+<h4 id="4-2、规范的开发流程"><a href="#4-2、规范的开发流程" class="headerlink" title="4.2、规范的开发流程"></a>4.2、规范的开发流程</h4><p><strong>分析业务背景</strong></p>
+<ul>
+<li>明确任务输入与输出，将其抽象为已得到很好解决的典型任务，明确评估指标</li>
+</ul>
+<p><strong>快速实现模型基线</strong></p>
+<ul>
+<li>准备小数据规模的格式规范的训练数据，进行无代码训练（最快）</li>
+<li>技术选型非常重要，需选择好网络和预训练模型</li>
+</ul>
+<p><strong>优化模型效果</strong></p>
+<ul>
+<li>各优化手段按照投入产出比排序如下：<br>a、进一步分析你的业务背景和需求，进行更细致的技术选型<br>b、采用本地工具进行本地小数据调试，极大地提升迭代效率<br>c、通过配置参数级训练进行自主调参<br>d、部分代码级训练（自定义组网）训练并进行调参<br>e、代码级训练进行深度自主开发<br>f、策略基本稳定后在足量的大数据上进行训练</li>
+</ul>
+<h4 id="4-3、开发方式的选择"><a href="#4-3、开发方式的选择" class="headerlink" title="4.3、开发方式的选择"></a>4.3、开发方式的选择</h4><p><strong>无代码训练（不调参）</strong></p>
+<ul>
+<li>如：EasyDL经典版、BML预制产线</li>
+<li>便于快速得到基线效果，无任何调参经验都可使用</li>
+</ul>
+<p><strong>配置参数级训练（自主调参）</strong></p>
+<ul>
+<li>如：EasyDL专业版、BML预置产线</li>
+<li>最好具备3个月调参经验，否则需补充相关知识</li>
+</ul>
+<p><strong>部分代码级训练（自定义组网）</strong></p>
+<ul>
+<li>如：EasyDL专业版、BML专业开发套件</li>
+<li>最好具备6个月调参经验，否则需要补充相关知识</li>
+</ul>
+<p><strong>代码级训练（深度自定义）</strong></p>
+<ul>
+<li>如：文心开源版，文心端到端开发套件</li>
+<li>最好具备6个月调参经验，否则需要补充相关知识</li>
+</ul>
+<h3 id="5、如何优化模型"><a href="#5、如何优化模型" class="headerlink" title="5、如何优化模型"></a>5、如何优化模型</h3><h4 id="5-1、优化数据"><a href="#5-1、优化数据" class="headerlink" title="5.1、优化数据"></a>5.1、优化数据</h4><p><strong>优化数据质量</strong></p>
+<ul>
+<li>对于ERNIE系列预训练模型，数据的质量优于数量</li>
+<li>反复观察badcase，针对典型case增加正确样本</li>
+<li>可考虑数据降噪相关策略</li>
+</ul>
+<p><strong>增加数据数量</strong></p>
+<ul>
+<li>通过学习曲线评估数据数量是否合适</li>
+<li>在数据集很大的情况下，建议小数据跑一跑</li>
+<li>可考虑数据增强等相关策略</li>
+</ul>
+<p><strong>增加数据特征</strong></p>
+<ul>
+<li>可考虑增加非文本数据特征</li>
+<li>可以尝试增加新的文本特征，比如N-gram、subword、分词边界、词性、语义组块等特征</li>
+</ul>
+<h4 id="5-2、优化调参与组网"><a href="#5-2、优化调参与组网" class="headerlink" title="5.2、优化调参与组网"></a>5.2、优化调参与组网</h4><p><strong>大原则</strong></p>
+<ul>
+<li>过拟合则降低复杂度：增加数据量，选用参数较少的模型</li>
+<li>欠拟合则提升复杂度：选择参数较多的复杂模型</li>
+<li>通过学习曲线判断是否过拟合</li>
+</ul>
+<p><strong>最常用的参数：学习率</strong></p>
+<ul>
+<li>最简单的方式是选用adam等自动调整学习率的优化器</li>
+<li>如果手动调整学习率，一般按等比数列调整，如每次放大（缩小）10倍/5倍</li>
+<li>ERNIE系列预训练模型对学习率更加敏感，一般建议直接采用预制学习率，如果需要调整，可进行2倍3倍的放缩进行试验</li>
+</ul>
+<p><strong>熟练运用热启动</strong></p>
+<ul>
+<li>可通过热启动进行多阶段训练，每一阶段将本阶段实验最好的策略模型保存起来，作为下一阶段迭代的热启动模型，可不断累加算法改进的效果</li>
+</ul>
+<p><strong>优化组网</strong></p>
+<ul>
+<li>一般建议先采用ERNIE模型不加下游复杂网络进行训练，之后再改进组网</li>
+</ul>
+<h3 id="6、附录"><a href="#6、附录" class="headerlink" title="6、附录"></a>6、附录</h3><h4 id="6-1、无代码调参训练建议具备的相关知识"><a href="#6-1、无代码调参训练建议具备的相关知识" class="headerlink" title="6.1、无代码调参训练建议具备的相关知识"></a>6.1、无代码调参训练建议具备的相关知识</h4><ul>
+<li>明确以下概念：有监督学习、标签、特征、训练集、验证集、测试集、逻辑回归、过拟合、欠拟合、激活函数、损失函数、神经网络、学习率、正则化、epoch、batch_size、分词、统计词表。</li>
+<li>知道回归与分类的区别</li>
+<li>知道如何通过收敛曲线判断过拟合与欠拟合</li>
+<li>知道准确率、召回率、精确度、F1值、宏平均、微平均的概念与区别</li>
+<li>知道为什么训练集、验证集、测试集要保证独立同分布</li>
+<li>知道什么是神经网络</li>
+<li>知道什么是迁移学习、什么是预训练模型、什么是finetune、迁移学习的优点是什么</li>
+<li>参考：周志华《机器学习》前三章</li>
+</ul>
+<h4 id="6-2、自定义组网训练建议具备的相关知识"><a href="#6-2、自定义组网训练建议具备的相关知识" class="headerlink" title="6.2、自定义组网训练建议具备的相关知识"></a>6.2、自定义组网训练建议具备的相关知识</h4><ul>
+<li>前提是已掌握无代码调参建议具备的相关知识</li>
+<li>明确以下概念：Sigmoid函数公式、softmax函数公式、交叉熵公式、前向传播、反向传播、SGD、Adma、词向量、embedding、dropout、BOW、CNN、RNN、GRU、LSTM、迁移学习等等</li>
+<li>知道神经网络为什么具有非线性切分能力</li>
+<li>知道NLP中一维CNN中卷积核大小、卷积核的个数各指代什么，时序最大池化层如何操作</li>
+<li>知道NLP中CNN与LSTM的区别，各擅长处理哪类文本问题</li>
+<li>知道为什么BOW模型无法识别词语顺序关系</li>
+<li>知道为什么会梯度爆炸，以及如何解决</li>
+<li>参考：花书《深度学习》6-10章，《基于深度学习的自然语言处理》整本</li>
+</ul>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>NLP</tag>
+        <tag>任务拆分</tag>
+        <tag>技术选型</tag>
+        <tag>训练效率</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>深度学习常用算子</title>
+    <url>/blog/2020/07/27/%E6%B7%B1%E5%BA%A6%E5%AD%A6%E4%B9%A0%E5%B8%B8%E7%94%A8%E7%AE%97%E5%AD%90/</url>
+    <content><![CDATA[<h2 id="1、TensorFlow常用算子"><a href="#1、TensorFlow常用算子" class="headerlink" title="1、TensorFlow常用算子"></a>1、TensorFlow常用算子</h2><table>
+<thead>
+<tr>
+<th>序号</th>
+<th>OP</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>Relu</td>
+<td>激活算子ReLU(x)=max(0,x)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Relu6</td>
+<td>激活算子LeakyRelu(x) = max(max(x, 0), 6)</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Shape</td>
+<td>-</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Abs</td>
+<td>-</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Sigmoid</td>
+<td>激活算子sigmoid(x) = 1. / (1. + exp(x))</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Exp</td>
+<td>-</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Rsqrt</td>
+<td>Tensor单个元素运算: y = 1 / sqrt{x}</td>
+</tr>
+<tr>
+<td>8</td>
+<td>swish_f32</td>
+<td>-</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Tanh</td>
+<td>激活算子tanh(x)=(exp(x)-exp(-x))/(exp(x)+exp(-x))</td>
+</tr>
+<tr>
+<td>10</td>
+<td>LeakyRelu</td>
+<td>激活算子LeakyRelu(x) = (x &gt;= 0 ? x : x*negative_slope)</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Add</td>
+<td>两个Tensor计算: +</td>
+</tr>
+<tr>
+<td>12</td>
+<td>RealDiv</td>
+<td>两个Tensor计算: /</td>
+</tr>
+<tr>
+<td>13</td>
+<td>Sub</td>
+<td>两个Tensor计算: -</td>
+</tr>
+<tr>
+<td>14</td>
+<td>Maximum</td>
+<td>-</td>
+</tr>
+<tr>
+<td>15</td>
+<td>Mul</td>
+<td>两个Tensor计算: *</td>
+</tr>
+<tr>
+<td>16</td>
+<td>FloorDiv</td>
+<td>-</td>
+</tr>
+<tr>
+<td>17</td>
+<td>Placeholder</td>
+<td>-</td>
+</tr>
+<tr>
+<td>18</td>
+<td>Const</td>
+<td>-</td>
+</tr>
+<tr>
+<td>19</td>
+<td>Transpose</td>
+<td>-</td>
+</tr>
+<tr>
+<td>20</td>
+<td>FusedBatchNorm</td>
+<td>-</td>
+</tr>
+<tr>
+<td>21</td>
+<td>Conv2D</td>
+<td>-</td>
+</tr>
+<tr>
+<td>22</td>
+<td>BiasAdd</td>
+<td>两个Tensor计算: 用于增加bias操作，通常bias是一维Tensor</td>
+</tr>
+<tr>
+<td>23</td>
+<td>MaxPool</td>
+<td>-</td>
+</tr>
+<tr>
+<td>24</td>
+<td>DepthwiseConv2dNative</td>
+<td>-</td>
+</tr>
+<tr>
+<td>25</td>
+<td>Reshape</td>
+<td>Tensor维度变换: 将输入Tensor描述转换为新的shape</td>
+</tr>
+<tr>
+<td>26</td>
+<td>AvgPool</td>
+<td>-</td>
+</tr>
+<tr>
+<td>27</td>
+<td>SplitV</td>
+<td>-</td>
+</tr>
+<tr>
+<td>28</td>
+<td>SquaredDifference</td>
+<td>-</td>
+</tr>
+<tr>
+<td>29</td>
+<td>Title</td>
+<td>Tensor维度变换: 将输入数据在每个维度上复制指定次数来生成输出数据</td>
+</tr>
+<tr>
+<td>30</td>
+<td>Pack</td>
+<td>Tensor维度变换: Pack算子为TensorFlow原生算子，最新的版本已经改名为：Stack。该算子以指定的轴axis，将一个维度为R的张量数组转变成一个维度为R+1的张量。</td>
+</tr>
+<tr>
+<td>31</td>
+<td>Pad</td>
+<td>Tensor维度变换: Tensor维度变换</td>
+</tr>
+<tr>
+<td>32</td>
+<td>ResizeBilinear</td>
+<td>-</td>
+</tr>
+<tr>
+<td>33</td>
+<td>Mean</td>
+<td>只有取均值功能的滑窗算子</td>
+</tr>
+<tr>
+<td>34</td>
+<td>MatMul</td>
+<td>两个Tensor计算: 矩阵乘</td>
+</tr>
+<tr>
+<td>35</td>
+<td>ArgMax</td>
+<td>-</td>
+</tr>
+<tr>
+<td>36</td>
+<td>StridedSlice</td>
+<td>-</td>
+</tr>
+<tr>
+<td>37</td>
+<td>Slice</td>
+<td>-</td>
+</tr>
+<tr>
+<td>38</td>
+<td>Sum</td>
+<td>-</td>
+</tr>
+<tr>
+<td>39</td>
+<td>Max</td>
+<td>-</td>
+</tr>
+<tr>
+<td>40</td>
+<td>Conv2DBackpropInput</td>
+<td>-</td>
+</tr>
+<tr>
+<td>41</td>
+<td>Cast</td>
+<td>-</td>
+</tr>
+<tr>
+<td>42</td>
+<td>Split</td>
+<td>-</td>
+</tr>
+<tr>
+<td>43</td>
+<td>Squeeze</td>
+<td>-</td>
+</tr>
+<tr>
+<td>44</td>
+<td>ResizeNearestNeighbor</td>
+<td>-</td>
+</tr>
+<tr>
+<td>45</td>
+<td>Softmax</td>
+<td>分类: 通常作为分类网络的最后一层，输出每类的概率</td>
+</tr>
+<tr>
+<td>46</td>
+<td>Range</td>
+<td>-</td>
+</tr>
+<tr>
+<td>47</td>
+<td>ConcatV2</td>
+<td>-</td>
+</tr>
+<tr>
+<td>48</td>
+<td>MirrorPad</td>
+<td>-</td>
+</tr>
+<tr>
+<td>49</td>
+<td>Identity</td>
+<td>-</td>
+</tr>
+<tr>
+<td>50</td>
+<td>GreaterEqual</td>
+<td>-</td>
+</tr>
+<tr>
+<td>51</td>
+<td>StopGradient</td>
+<td>-</td>
+</tr>
+<tr>
+<td>52</td>
+<td>Minimum</td>
+<td>-</td>
+</tr>
+<tr>
+<td>53</td>
+<td>RadnomUniform</td>
+<td>-</td>
+</tr>
+<tr>
+<td>54</td>
+<td>Fill</td>
+<td>-</td>
+</tr>
+<tr>
+<td>55</td>
+<td>Floor</td>
+<td>-</td>
+</tr>
+<tr>
+<td>56</td>
+<td>DepthToSpace</td>
+<td>-</td>
+</tr>
+</tbody></table>
+<h2 id="2、Caffe常用算子"><a href="#2、Caffe常用算子" class="headerlink" title="2、Caffe常用算子"></a>2、Caffe常用算子</h2><table>
+<thead>
+<tr>
+<th>序号</th>
+<th>OP</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>Input</td>
+<td>-</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Convolution</td>
+<td>分区域进行特征值提取</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Deconvolution</td>
+<td>将一个低维度的空间映射到高维度，同时保持他们之间的连接关系/模式</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Pooling</td>
+<td>-</td>
+</tr>
+<tr>
+<td>5</td>
+<td>LRN</td>
+<td>归一化: Local Response Normalization，即局部响应归一化层</td>
+</tr>
+<tr>
+<td>6</td>
+<td>InnerProduct</td>
+<td>-</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Softmax</td>
+<td>-</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Slice</td>
+<td>-</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Concat</td>
+<td>实现多个算子的拼接</td>
+</tr>
+<tr>
+<td>10</td>
+<td>PReLU</td>
+<td>-</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Accuracy</td>
+<td>-</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Eltwise</td>
+<td>多个Tensor计算: 多个Tensor对应位置元素进行相乘、相加、取最大值中一种操作</td>
+</tr>
+<tr>
+<td>13</td>
+<td>BatchNorm</td>
+<td>归一化: 加快神经网络的训练收敛速度</td>
+</tr>
+<tr>
+<td>14</td>
+<td>Scale</td>
+<td>Tensor单个元素运算: y(x)=scale*x+bias</td>
+</tr>
+<tr>
+<td>15</td>
+<td>Reshape</td>
+<td>-</td>
+</tr>
+<tr>
+<td>16</td>
+<td>ArgMax</td>
+<td>-</td>
+</tr>
+<tr>
+<td>17</td>
+<td>Crop</td>
+<td>-</td>
+</tr>
+<tr>
+<td>18</td>
+<td>Flatten</td>
+<td>-</td>
+</tr>
+<tr>
+<td>19</td>
+<td>Power</td>
+<td>Tensor单个元素运算: f(x)= (scale * x + shift) ^ power</td>
+</tr>
+<tr>
+<td>20</td>
+<td>Reduction</td>
+<td>-</td>
+</tr>
+<tr>
+<td>21</td>
+<td>Axpy</td>
+<td>两个Tensor计算: 向量求和，公式y += a * x</td>
+</tr>
+<tr>
+<td>22</td>
+<td>ROIPolling</td>
+<td>对ROI进行pooling操作，从不同大小的方框得到固定大小相应的feature maps</td>
+</tr>
+<tr>
+<td>23</td>
+<td>Permute</td>
+<td>调整Tensor的输入维度顺序</td>
+</tr>
+<tr>
+<td>24</td>
+<td>DetectionOutput</td>
+<td>-</td>
+</tr>
+<tr>
+<td>25</td>
+<td>Normalize</td>
+<td>-</td>
+</tr>
+<tr>
+<td>26</td>
+<td>Select</td>
+<td>-</td>
+</tr>
+<tr>
+<td>27</td>
+<td>ShuffleChannel</td>
+<td>调整C维的排序</td>
+</tr>
+<tr>
+<td>28</td>
+<td>ConvolutionDepthwise</td>
+<td>-</td>
+</tr>
+<tr>
+<td>29</td>
+<td>ReLU</td>
+<td>-</td>
+</tr>
+<tr>
+<td>30</td>
+<td>AbsVal</td>
+<td>Tensor单个元素运算: y(x)=</td>
+</tr>
+<tr>
+<td>31</td>
+<td>Sigmoid</td>
+<td>-</td>
+</tr>
+<tr>
+<td>32</td>
+<td>TanH</td>
+<td>-</td>
+</tr>
+</tbody></table>
+<h2 id="3、ONNX常用算子"><a href="#3、ONNX常用算子" class="headerlink" title="3、ONNX常用算子"></a>3、ONNX常用算子</h2><table>
+<thead>
+<tr>
+<th>序号</th>
+<th>OP</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>Relu</td>
+<td>-</td>
+</tr>
+<tr>
+<td>2</td>
+<td>LeakyRelu</td>
+<td>-</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Elu</td>
+<td>-</td>
+</tr>
+<tr>
+<td>4</td>
+<td>ThresholdedRelu</td>
+<td>-</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Prelu</td>
+<td>-</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Tanh</td>
+<td>-</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Shrink</td>
+<td>-</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Sigmoid</td>
+<td>-</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Pow</td>
+<td>-</td>
+</tr>
+<tr>
+<td>10</td>
+<td>Softplus</td>
+<td>-</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Softsign</td>
+<td>-</td>
+</tr>
+<tr>
+<td>12</td>
+<td>HardSigmoid</td>
+<td>-</td>
+</tr>
+<tr>
+<td>13</td>
+<td>Exp</td>
+<td>-</td>
+</tr>
+<tr>
+<td>14</td>
+<td>Add</td>
+<td>-</td>
+</tr>
+<tr>
+<td>15</td>
+<td>Div</td>
+<td>-</td>
+</tr>
+<tr>
+<td>16</td>
+<td>Sub</td>
+<td>-</td>
+</tr>
+<tr>
+<td>17</td>
+<td>Mul</td>
+<td>-</td>
+</tr>
+<tr>
+<td>18</td>
+<td>Shape</td>
+<td>-</td>
+</tr>
+<tr>
+<td>19</td>
+<td>Clip</td>
+<td>-</td>
+</tr>
+<tr>
+<td>20</td>
+<td>AveragePool</td>
+<td>-</td>
+</tr>
+<tr>
+<td>21</td>
+<td>Sqrt</td>
+<td>-</td>
+</tr>
+<tr>
+<td>22</td>
+<td>ReduceSum</td>
+<td>-</td>
+</tr>
+<tr>
+<td>23</td>
+<td>ReduceMin</td>
+<td>-</td>
+</tr>
+<tr>
+<td>24</td>
+<td>ReduceMean</td>
+<td>-</td>
+</tr>
+<tr>
+<td>25</td>
+<td>Constant</td>
+<td>-</td>
+</tr>
+<tr>
+<td>26</td>
+<td>Pad</td>
+<td>-</td>
+</tr>
+<tr>
+<td>27</td>
+<td>Unsqueeze</td>
+<td>-</td>
+</tr>
+<tr>
+<td>28</td>
+<td>Resize</td>
+<td>-</td>
+</tr>
+<tr>
+<td>29</td>
+<td>Upsample</td>
+<td>-</td>
+</tr>
+<tr>
+<td>30</td>
+<td>Expand</td>
+<td>-</td>
+</tr>
+<tr>
+<td>31</td>
+<td>Gather</td>
+<td>-</td>
+</tr>
+<tr>
+<td>32</td>
+<td>Slice</td>
+<td>-</td>
+</tr>
+<tr>
+<td>33</td>
+<td>Cast</td>
+<td>-</td>
+</tr>
+<tr>
+<td>34</td>
+<td>Split</td>
+<td>-</td>
+</tr>
+<tr>
+<td>35</td>
+<td>Reshape</td>
+<td>-</td>
+</tr>
+<tr>
+<td>36</td>
+<td>ConstantOfShape</td>
+<td>-</td>
+</tr>
+<tr>
+<td>37</td>
+<td>Ceil</td>
+<td>-</td>
+</tr>
+<tr>
+<td>38</td>
+<td>Concat</td>
+<td>实现多个算子的拼接</td>
+</tr>
+<tr>
+<td>39</td>
+<td>Flatten</td>
+<td>将输入tensor中从start_axis维度到end_axis维度合并为1维</td>
+</tr>
+<tr>
+<td>40</td>
+<td>ConvTranspose</td>
+<td>-</td>
+</tr>
+<tr>
+<td>41</td>
+<td>MatMul</td>
+<td>-</td>
+</tr>
+<tr>
+<td>42</td>
+<td>Sum</td>
+<td>-</td>
+</tr>
+<tr>
+<td>43</td>
+<td>Transpose</td>
+<td>-</td>
+</tr>
+<tr>
+<td>44</td>
+<td>BatchNormalization</td>
+<td>-</td>
+</tr>
+<tr>
+<td>45</td>
+<td>Squeeze</td>
+<td>-</td>
+</tr>
+<tr>
+<td>46</td>
+<td>Equal</td>
+<td>-</td>
+</tr>
+<tr>
+<td>47</td>
+<td>Identity</td>
+<td>-</td>
+</tr>
+<tr>
+<td>48</td>
+<td>GlobalAveragePool</td>
+<td>-</td>
+</tr>
+<tr>
+<td>49</td>
+<td>MaxPool</td>
+<td>-</td>
+</tr>
+<tr>
+<td>50</td>
+<td>Conv</td>
+<td>-</td>
+</tr>
+<tr>
+<td>51</td>
+<td>Gemm</td>
+<td>-</td>
+</tr>
+<tr>
+<td>52</td>
+<td>NonZero</td>
+<td>-</td>
+</tr>
+<tr>
+<td>53</td>
+<td>Abs</td>
+<td>-</td>
+</tr>
+<tr>
+<td>54</td>
+<td>Floor</td>
+<td>-</td>
+</tr>
+</tbody></table>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>常用算子</tag>
+        <tag>Op</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>深度学习模型评估指标</title>
+    <url>/blog/2020/07/24/%E6%B7%B1%E5%BA%A6%E5%AD%A6%E4%B9%A0%E6%A8%A1%E5%9E%8B%E8%AF%84%E4%BC%B0%E6%8C%87%E6%A0%87/</url>
+    <content><![CDATA[<p>一个深度学习模型在各类任务中的表现都需要定量的指标进行评估，才能够进行横向的对比比较，本文介绍了<strong>分类、回归、质量评估、生成模型</strong>中常用的指标。</p>
+<h3 id="1、分类评测指标"><a href="#1、分类评测指标" class="headerlink" title="1、分类评测指标"></a>1、分类评测指标</h3><p>图像分类是计算机视觉中最基础的一个任务，也是几乎所有的基准模型进行比较的任务，从最开始比较简单的10分类的灰度图像手写数字识别mnist，到后来更大一点的10分类的cifar10和100分类的cifar100，到后来的imagenet，图像分类任务伴随着数据库的增长，一步一步提升到了今天的水平。现在在Imagenet这样的超过1000万图像，2万类的数据集中，计算机的图像分类水准已经超过了人类。</p>
+<p>图像分类，顾名思义就是一个模式分类问题，它的目标是将不同的图像，划分到不同的类别，实现最小的分类误差，这里只考虑单标签分类问题，即每一个图片都有唯一的类别。</p>
+<p><strong>对于单个标签分类的问题，评价指标主要有Accuracy，Precision，Recall，F-score，PR曲线，ROC和AUC。</strong></p>
+<p>在计算这些指标之前，先计算几个基本指标，这些指标是基于二分类的任务，也可以拓展到多分类：</p>
+<ul>
+<li>标签为正样本，分类为正样本的数目为True Positive，简称TP</li>
+<li>标签为正样本，分类为负样本的数目为False Negative，简称FN</li>
+<li>标签为负样本，分类为正样本的数目为False Positive，简称FP</li>
+<li>标签为负样本，分类为负样本的数目为True Negative，简称TN</li>
+</ul>
+<p>判别是否为正例只需要设一个概率阈值T，预测概率大于阈值T的为正类，小于阈值T的为负类，默认就是0.5。如果我们减小这个阀值T，更多的样本会被识别为正类，这样可以提高正类的召回率，但同时也会带来更多的负类被错分为正类。如果增加阈值T，则正类的召回率降低，精度增加。如果是多类，比如ImageNet1000分类比赛中的1000类，预测类别就是预测概率最大的那一类。</p>
+<h4 id="1-1、准确率Accuracy"><a href="#1-1、准确率Accuracy" class="headerlink" title="1.1、准确率Accuracy"></a>1.1、准确率Accuracy</h4><p>单标签分类任务中每一个样本都只有一个确定的类别，预测到该类别就是分类正确，没有预测到就是分类错误，因此最直观的指标就是Accuracy，也就是准确率。</p>
+<p><strong>Accuracy=(TP+TN)/(TP+FP+TN+FN)</strong>，表示的就是所有样本都正确分类的概率，可以使用不同的阈值T。</p>
+<p>在ImageNet中使用的Accuracy指标包括Top_1 Accuracy和Top_5 Accuracy，Top_1 Accuracy就是前面计算的Accuracy。</p>
+<p>记样本xi的类别为yi，类别种类为(0,1,…,C)，预测类别函数为f，则Top-1的计算方法如下：</p>
+<p><img src="1.png" alt></p>
+<p>如果给出概率最大的5个预测类别，只要包含了真实的类别，则判定预测正确，计算出来的指标就是Top-5。目前在ImageNet上，Top-5的指标已经超过95%，而Top-1的指标还在80%左右。</p>
+<h4 id="1-2、精确度Precision和召回率Recall"><a href="#1-2、精确度Precision和召回率Recall" class="headerlink" title="1.2、精确度Precision和召回率Recall"></a>1.2、精确度Precision和召回率Recall</h4><p>如果只考虑正样本的指标，有两个很常用的指标，精确度和召回率。</p>
+<p>正样本精确率为：<strong>Precision=TP/(TP+FP)</strong>，表示的是召回为正样本的样本中，到底有多少是真正的正样本。</p>
+<p>正样本召回率为：<strong>Recall=TP/(TP+FN)</strong>，表示的是有多少样本被召回类。当然，如果对负样本感兴趣的，也可以计算对应的精确率和召回率，这里记得区分精确率和准确率的分别。</p>
+<p>通常召回率越高，精确度越低，根据不同的值可以绘制Recall-Precision曲线，如下图：</p>
+<p><img src="2.png" alt></p>
+<p><strong>横轴就是recall，纵轴就是precision，曲线越接近右上角，说明其性能越好，可以用该曲线与坐标轴包围的面积来定量评估，值在0～1之间。</strong></p>
+<h4 id="1-3、F1-score"><a href="#1-3、F1-score" class="headerlink" title="1.3、F1 score"></a>1.3、F1 score</h4><p>有的时候关注的不仅仅是正样本的准确率，也关心其召回率，但是又不想用Accuracy来进行衡量，一个折中的指标是采用F-score。</p>
+<p><img src="20.webp" alt></p>
+<p>β是用来平衡Precision,Recall在F-score计算中的权重,取值情况有以下三种:</p>
+<ul>
+<li>如果取1,表示Precision与Recall一样重要</li>
+<li>如果取小于1,表示Precision比Recall重要</li>
+<li>如果取大于1,表示Recall比Precision重要</li>
+</ul>
+<p>一般情况下,β取1，认为两个指标一样重要.此时F-score的计算公式为:</p>
+<p><strong>F1 score=2·Precision·Recall/(Precision+Recall)</strong>，只有在召回率Recall和精确率Precision都高的情况下，F1 score才会很高，因此F1 score是一个综合性能的指标。</p>
+<h4 id="1-4、混淆矩阵"><a href="#1-4、混淆矩阵" class="headerlink" title="1.4、混淆矩阵"></a>1.4、混淆矩阵</h4><p>如果对于每一类，若想知道类别之间相互误分的情况，查看是否有特定的类别之间相互混淆，就可以用混淆矩阵画出分类的详细预测结果。对于包含多个类别的任务，混淆矩阵很清晰的反映出各类别之间的错分概率，如下图：</p>
+<p><img src="3.png" alt></p>
+<p>上图表述的是一个包含20个类别的分类任务，混淆矩阵为20<em>20的矩阵，其中第i行第j列，表示第i类目标被分类为第j类的概率，*</em>越好的分类器对角线上的值更大，其他地方应该越小。**</p>
+<h4 id="1-5、ROC曲线与AUC指标"><a href="#1-5、ROC曲线与AUC指标" class="headerlink" title="1.5、ROC曲线与AUC指标"></a>1.5、ROC曲线与AUC指标</h4><p>以上的准确率Accuracy，精确度Precision，召回率Recall，F1 score，混淆矩阵都只是一个单一的数值指标，如果想观察分类算法在不同的参数下的表现情况，就可以使用一条曲线，即<strong>ROC曲线</strong>，全称为receiver operating characteristic。</p>
+<p><strong>ROC曲线可以用于评价一个分类器在不同阈值下的表现情况。</strong>在ROC曲线中，每个点的横坐标是false positive rate(FPR)，纵坐标是true positive rate(TPR)，描绘了分类器在True Positive和False Positive间的平衡，两个指标的计算如下：</p>
+<p><strong>TPR=TP/(TP+FN)</strong>，代表分类器预测的正类中实际正实例占所有正实例的比例。</p>
+<p><strong>FPR=FP/(FP+TN)</strong>，代表分类器预测的正类中实际负实例占所有负实例的比例，FPR越大，预测正类中实际负类越多。</p>
+<p>ROC曲线通常如下：</p>
+<p><img src="4.png" alt></p>
+<p>其中有4个关键的点：</p>
+<ul>
+<li>点(0,0)：FPR=TPR=0，分类器预测所有的样本都为负样本</li>
+<li>点(1,1)：FPR=TPR=1，分类器预测所有的样本都为正样本</li>
+<li>点(0,1)：FPR=0, TPR=1，此时FN＝0且FP＝0，所有的样本都正确分类</li>
+<li>点(1,0)：FPR=1，TPR=0，此时TP＝0且TN＝0，最差分类器，避开了所有正确答案</li>
+</ul>
+<p>ROC曲线相对于PR曲线有个很好的特性：</p>
+<p><strong>当测试集中的正负样本的分布变化的时候，ROC曲线能够保持不变，即对正负样本不均衡问题不敏感。</strong>比如负样本的数量增加到原来的10倍，TPR不受影响，FPR的各项也是成比例的增加，并不会有太大的变化。所以不均衡样本问题通常选用ROC作为评价标准。</p>
+<p>ROC曲线越接近左上角，该分类器的性能越好，若一个分类器的ROC曲线完全包住另一个分类器，那么可以判断前者的性能更好。</p>
+<p>如果想通过两条ROC曲线来定量评估两个分类器的性能，就可以使用<strong>AUC指标</strong>。</p>
+<p>AUC（Area Under Curve）为ROC曲线下的面积，它表示的就是一个概率，这个面积的数值不会大于1。随机挑选一个正样本以及一个负样本，AUC表征的就是有多大的概率，分类器会对正样本给出的预测值高于负样本，当然前提是正样本的预测值的确应该高于负样本。</p>
+<h4 id="1-6、TAR，FRR，FAR"><a href="#1-6、TAR，FRR，FAR" class="headerlink" title="1.6、TAR，FRR，FAR"></a>1.6、TAR，FRR，FAR</h4><p>这几个指标在人脸验证中被广泛使用，人脸验证即匹配两个人是否是同一个人，<strong>通常用特征向量的相似度进行描述，如果相似度概率大于阈值T，则被认为是同一个人。</strong></p>
+<p><strong>TAR（True Accept Rate）表示正确接受的比例</strong>，多次取同一个人的两张图像，统计该相似度值超过阈值T的比例。</p>
+<p><strong>FRR（False Reject Rate）就是错误拒绝率</strong>，把相同的人的图像当做不同人的了，它等于1-TAR。</p>
+<p><strong>FAR（False Accept Rate）表示错误接受的比例</strong>，多次取不同人的两张图像，统计该相似度值超过T的比例。</p>
+<p>增大相似度阈值T，FAR和TAR都减小，意味着正确接受和错误接受的比例都降低，错误拒绝率FRR会增加。减小相似度阈值T，FAR和TAR都增大，正确接受的比例和错误接受的比例都增加，错误拒绝率FRR降低。</p>
+<h3 id="2、检索与回归指标"><a href="#2、检索与回归指标" class="headerlink" title="2、检索与回归指标"></a>2、检索与回归指标</h3><h4 id="2-1、IoU"><a href="#2-1、IoU" class="headerlink" title="2.1、IoU"></a>2.1、IoU</h4><p>IoU全称Intersection-over-Union，即交并比，在目标检测领域中，定义为两个矩形框面积的交集和并集的比值，<strong>IoU=A∩B/A∪B</strong>。</p>
+<p><img src="5.png" alt></p>
+<p>如果完全重叠，则IoU等于1，是最理想的情况。一般在检测任务中，IoU大于等于0.5就认为召回，如果设置更高的IoU阈值，则召回率下降，同时定位框也越更加精确。</p>
+<p>在图像分割中也会经常使用IoU，此时就不必限定为两个矩形框的面积。比如对于二分类的前背景分割，那么IoU=(真实前景像素面积∩预测前景像素面积)/(真实前景像素面积∪预测前景像素面积)，这一个指标，通常比直接计算每一个像素的分类正确概率要低，也对错误分类更加敏感。</p>
+<h4 id="2-2、AP和mAP"><a href="#2-2、AP和mAP" class="headerlink" title="2.2、AP和mAP"></a>2.2、AP和mAP</h4><p>Average Precision简称AP，这是一个在检索任务和回归任务中经常使用的指标，实际等于Precision-Recall曲线下的面积，这个曲线在上一小节已经说过，下面针对目标检测中举出一个例子进行计算，这一个例子在网上也是广泛流传。</p>
+<p>假如一幅图像，有10个人脸，检索出来了20个目标框，每一个目标框的概率以及真实的标签如下，真实标签的计算就用检测框与真实标注框的IoU是否大于0.5来计算。</p>
+<p>第一步，就是根据模型得到概率，计算IoU得到下面的表：</p>
+<p><img src="6.png" alt></p>
+<p>第二步，将上面的表按照概率进行排序</p>
+<p><img src="7.png" alt></p>
+<p>Precision的计算如下，以返回的top-5结果为例：</p>
+<p><img src="8.png" alt></p>
+<p>在这个例子中，true positives就是真正的人脸，从Label一栏可以看出，指的是id = 4，2，7，9，16，20的样本。</p>
+<p>前5个概率值最大的id中13，19，6是false positives。所以此时的Precision=2/5=40%，即选定了5个人脸，但是只有两个是对的。recall=2/6=33.3%，即总共有6个人脸，但是只召回了2个。</p>
+<p>在一个实际的目标检测任务中，目标的数量不一定是5个，所以不能只通过top-5来来衡量一个模型的好坏，选定的id越多，recall就越高，precision整体上则会呈现出下降趋势，因为排在前面的概率高的，一般更有可能是真实的样本，而后面概率低的更有可能是负样本。</p>
+<p>令N是所有id，如果从top-1到top-N都统计一遍，得到了对应的precision和recall，以recall为横坐标，precision为纵坐标，则得到了检测中使用的precision-recall曲线，虽然整体趋势和意义与分类任务中的precision-recall曲线相同，计算方法却有很大差别。</p>
+<p>PASCAL VOC 2010年提出了一个更好的指标mAP，对于样本不均衡的类的计算更加有效。假设有N个id，其中有M个label，则取M个recall节点，从0到1按照1/M的等间距，对于每个recall值，计算出大于该recall值的最大precision，然后对这M个precision值取平均得到最后的AP值，mAP的计算方法不变。</p>
+<p><strong>AP衡量的是学出来的模型在一个类别上的好坏，mAP衡量的是学出的模型在所有类别上的好坏。</strong></p>
+<h3 id="3、图像质量评价指标"><a href="#3、图像质量评价指标" class="headerlink" title="3、图像质量评价指标"></a>3、图像质量评价指标</h3><p>图像在获取，压缩，存储，传输，解压缩，显示，甚至打印的过程中，都有可能受到环境的干扰造成质量下降。图像的质量，通常跟图像噪声，模糊，对比度，美学等有关系。</p>
+<p>在图像质量评估的指标中，根据对原始无损图像的要求，通常分为三大类，分别是<strong>Full Reference Image Quality Assessment(FR-IQA)全参考图像评价，Reduced Reference Image Quality Assessment(FR-IQA)半参考图像评价，No Reference Image Quality Assessment(FR-IQA)无参考图像评价</strong>。</p>
+<ul>
+<li><p>Full Reference Image Quality Assessment(FR-IQA)全参考图像评价，需要原始的高质量的图像。常见的(FR-IQA)包括峰值信噪比PSNR，结构一致性相似因子structural similarity index measurement(SSIM)，视觉信息保真度 (Visual information fidelity, VIF)，视觉信噪比 (Visual signal-to-noise ratio, VSPR)，最显著失真 (Most apparent distortion, MAD)等。</p>
+</li>
+<li><p>Reduced Reference Image Quality Assessment(RR-IQA)半参考图像评价，不需要原始图像本身，但是需要一些特征，在卫星和遥感图像中被使用的较多。RR-IQA类方法常常在不同的特征空间中使用，主要思路是对FR-IQA类评价指标进行近似。</p>
+</li>
+<li><p>No Reference Image Quality Assessment(NR-IQA)无参考图像评价，完全基于图像本身，不再需要原始图。不过由于没有原始的图像，需要对原始的图像进行统计建模，同时还要兼顾人眼的视觉特征，本来这就有一定的主观和不确定性。虽然研究人员提出了数十个NR-IQA指标，但是真正广泛使用的没有几个。另外无参考的美学质量评估也是当前比较开放的一个问题，它需要更多考虑摄影学等因素。</p>
+</li>
+</ul>
+<p>质量评价因子非常的多，限于篇幅仅介绍其中4个：</p>
+<h4 id="3-1、信噪比SNR与峰值信噪比PSNR"><a href="#3-1、信噪比SNR与峰值信噪比PSNR" class="headerlink" title="3.1、信噪比SNR与峰值信噪比PSNR"></a>3.1、信噪比SNR与峰值信噪比PSNR</h4><p>信噪比，即SNR(SIGNAL-NOISE RATIO)，是信号处理领域广泛使用的定量描述指标。它原是指一个电子设备或者电子系统中信号与噪声的比例，计量单位是dB，其计算方法是10<em>lg(Ps/Pn)，其中Ps和Pn分别代表信号和噪声的有效功率，也可以换算成电压幅值的比率关系：20</em>lg(Vs/Vn)，Vs和Vn分别代表信号和噪声电压的“有效值”。</p>
+<p>在图像处理领域，更多的是采用峰值信噪比PSNR (Peak Signal to NoiseRatio)，它是原图像与处理图像之间均方误差(Mean Square Error)相对于(2^n-1)^2 的对数值，其中n是每个采样值的比特数，8位图像即为256。</p>
+<p><img src="9.png" alt></p>
+<p>PSNR越大表示失真越小，均方误差的计算如下：</p>
+<p><img src="10.png" alt></p>
+<p>其中M，N为图像的行与列数，μi,j是像素灰度平均值，fi,j即像素灰度值。</p>
+<p>下面展示了JPEG和JPEG2000算法在不同压缩率下的PSNR，通常PSNR大于35的图像质量会比较好。</p>
+<p><img src="11.png" alt></p>
+<h4 id="3-2、结构一致性相似因子SSIM"><a href="#3-2、结构一致性相似因子SSIM" class="headerlink" title="3.2、结构一致性相似因子SSIM"></a>3.2、结构一致性相似因子SSIM</h4><p>PSNR从底层信噪的角度来评估图像的质量，但是人眼对质量的评价关注的层次其实更高。根据Human visual system model，人眼观察图像有几个特点：</p>
+<ul>
+<li>低通过滤器特性，即人眼对于过高的频率难以分辨。</li>
+<li>人眼对亮度的敏感大于对颜色的敏感。</li>
+<li>对亮度的响应不是线性变换的，在平均亮度大的区域，人眼对灰度误差不敏感。</li>
+<li>边缘和纹理敏感，有很强的局部观察能力。</li>
+</ul>
+<p>structural similarity index measurement(SSIM)是一种建立在人眼的视觉特征基础上的用于衡量两幅图像相似度的指标，结果在0～1之间。</p>
+<p>结构相似性理论认为自然图像信号是高度结构化的，空域像素间有很强的相关性并蕴含着物体结构的重要信息。它没有试图通过累加与心理物理学简单认知模式有关的误差来估计图像质量，而是直接估计两个复杂结构信号的结构改变，并将失真建模为亮度、对比度和结构三个不同因素的组合。用均值作为亮度的估计，标准差作为对比度的估计，协方差作为结构相似程度的度量。</p>
+<p>PSNR忽略了人眼对图像不同区域的敏感度差异，在不同程度上降低了图像质量评价结果的可靠性，而SSIM能突显轮廓和细节等特征信息。</p>
+<p>SSIM具体的计算如下：首先结构信息不应该受到照明的影响，因此在计算结构信息时需要去掉亮度信息，即需要减掉图像的均值；其次结构信息不应该受到图像对比度的影响，因此计算结构信息时需要归一化图像的方差。</p>
+<p>通常使用的计算方法如下，其中C1，C2，C3用来增加计算结果的稳定性，光度L，对比度C，结构对比度S计算如下：</p>
+<p><img src="12.png" alt></p>
+<p>ux，uy为图像的均值</p>
+<p><img src="13.png" alt></p>
+<p>dx，dy为图像的方差</p>
+<p><img src="14.png" alt></p>
+<p>d(x,y)为图像x，y的协方差。而图像质量SSIM = L(x,y)^aC(x,y)^bS(x,y)^c，其中a，b，c分别用来控制三个要素的重要性，为了计算方便可以均选择为1，C1，C2，C3为比较小的数值，通常C1=(K1×L)^2, C2=(K2×L)^2，C3 = C2/2， K1 &lt;&lt; 1， K2 &lt;&lt; 1，L为像素的最大值(通常为255)。当a，b，c都等于1，C3=C2/2时，SSIM的定义式就为：</p>
+<p><img src="15.png" alt></p>
+<p>SSIM发展出了许多的改进版本，其中较好的包括Fast SSIM，Multi-scale SSIM。</p>
+<h4 id="3-3、无参考锐化因子CPBD"><a href="#3-3、无参考锐化因子CPBD" class="headerlink" title="3.3、无参考锐化因子CPBD"></a>3.3、无参考锐化因子CPBD</h4><p>上面说的这两个，都是需要参考图像才能进行评价的，而CPBD即cumulative probability of blur detection (CPBD)，是一种无参考的图像锐化定量指标评价因子。它是基于模糊检测的累积概率来进行定义，是基于分类的方法。</p>
+<p>首先要说Just-noticeable-distortion-model，简称JND模型，即恰可察觉失真模型，它建模人眼能够察觉的图像底层特征，只有超过一定的阈值才会被察觉为失真图像。如果在空间域计算，一般会综合考虑亮度，纹理等因素，比如用像素点处局部平均背景亮度值作为亮度对比度阈值，用各个方向的梯度作为纹理阈值。如果在变换域计算，则可以使用小波系数等，这里对其计算方法就不再详述。</p>
+<p>在给定一个对比度高于JND (Just Noticeable Difference)参考的情况下，定义JNB (Just-noticeable-blue)指标为感知到的模糊像素的最小数目，边缘处像素的模糊概率定义如下：</p>
+<p><img src="16.png" alt></p>
+<p>其中分子是基于局部对比度的JNB边缘宽度，而分母是计算出的边缘宽度。对于每一幅图像，取子块大小为64×64，然后将其分为边缘块与非边缘块，非边缘块不做处理。对于每一个边缘块，计算出块内每个边缘像素的宽度。当pblur&lt;63%，该像素即作为有效的像素，用于计算CPBD指标，定义如下：</p>
+<p><img src="17.png" alt></p>
+<p>CPBD的作者采用了高斯模糊的图像与JPEG压缩图像进行实验，表明CPBD是符合人类视觉特性的图像质量指标，值越大，所反映出的细节越清晰，模糊性越弱。因此，可以将此指标用于定量评判滤波后的图像的锐化质量。</p>
+<h3 id="4、图像生成评价指标"><a href="#4、图像生成评价指标" class="headerlink" title="4、图像生成评价指标"></a>4、图像生成评价指标</h3><p>当需要评估一个生成模型的性能的时候，有2个最重要的衡量指标。</p>
+<ul>
+<li><p>确定性：生成模型生成的样本一定属于特定的类别，也就是真实的图像，而且必须要是所训练的图片集，不能用人脸图像训练得到了手写数字。</p>
+</li>
+<li><p>多样性：样本应该各式各样，如果用mnist进行训练，在没有条件限制的条件下，应该生成0，1，2，3…，而不是都是0，生成的各个数字也应该具有不同的笔触，大小等。除此之外，还会考虑分辨率等。</p>
+</li>
+</ul>
+<h4 id="4-1、inception-score"><a href="#4-1、inception-score" class="headerlink" title="4.1、inception score"></a>4.1、inception score</h4><p>inception score是最早的用于GAN生成的图像多样性评估的指标，它利用了google的inception模型来进行评估，背后的思想就完美满足上面的两个衡量指标。</p>
+<p>Inception图像分类模型预测结果是一个softmax后的向量，即概率分布p(y|x)。一个好的分类模型，该向量分布的熵应该尽可能地小，也就是样本必须明确符合某一个类，其中的一个值很大，剩下的值很小。另外，如果把softmax后的向量组合并在一起形成另一个概率分布p(y)，为了满足多样性，这个分布的熵应该是越大越好，也就是各种类别的样本都有。</p>
+<p>具体实现就是让p(y|x)和p(y)之间的KL散度越大越好，连续形式的表达如下：</p>
+<p><img src="18.png" alt></p>
+<p>实际的计算就是将积分换成求和：</p>
+<p><img src="19.png" alt></p>
+<p>Inception Score是一个非常好的评价指标，它同时评估生成图像的质量和多样性，前段时间大火的BigGAN，就是将Inception Score提升为原来最好模型的3倍不止。</p>
+<p>不过Inception Score也有缺陷，因为它仅评估图像生成模型，没有评估生成的图像与原始训练图像之间的相似度，因此虽然鼓励模型学习了质量好，多样性好的图像，但是却不能保证是我们想要的图像。Mode分数对其进行了改进，增加了KL散度来度量真实分布P_r与生成分布P_g之间的差异。</p>
+<h4 id="4-2、Kernel-MMD"><a href="#4-2、Kernel-MMD" class="headerlink" title="4.2、Kernel MMD"></a>4.2、Kernel MMD</h4><p>最大平均差异maximum mean discrepancy Kernel也是一个用于判断两个分布p和q是否相同的指标。它的基本假设就是如果两个样本分布相似，那么通过寻找在样本空间上的连续函数f，求不同分布的样本f函数的均值，计算均值的差作为两个分布在f函数下的平均差异，选择其中最大值就是MMD。</p>
+<p>对于深度学习任务来说，可以选择各种预训练模型的特征空间，比如性能很好的ResNet。MMD方法的样本复杂度和计算复杂度都比较低，不过是有偏的，关键就在于用于选择的函数空间是否足够丰富。</p>
+<p>除了以上指标外，还有Wasserstein距离，Fréchet Inception距离等。</p>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>评估指标</tag>
+        <tag>分类任务</tag>
+        <tag>回归任务</tag>
+        <tag>质量评估</tag>
+        <tag>生成模型</tag>
+      </tags>
+  </entry>
+  <entry>
+    <title>算法面试</title>
+    <url>/blog/2020/06/29/%E7%AE%97%E6%B3%95%E9%9D%A2%E8%AF%95/</url>
+    <content><![CDATA[<p><strong>1. n个人之间存在m个关系对，关系具有传递性，假如A关注B，B关注C，那么A就间接关注了C。如果一个人被除他之外的所有人都直接或间接关注，那么这个人就是抖音红人，求抖音红人的总数?</strong></p>
+<p><strong>2. 特征选择有哪些方法?（介绍项目时涉及到了特征相关性分析，因此问了这个）</strong></p>
+<p><strong>3. FM是否也能起到自动特征选择的作用，为什么?</strong></p>
+<p><strong>4. GBDT的原理，与随机森林等算法做比较?</strong></p>
+<p><strong>5. svm损失函数推导。</strong></p>
+<p><strong>6. 朴素贝叶斯写公式。</strong></p>
+<p><strong>7. 两个单链表如何找到第一个公共结点？</strong></p>
+<p><strong>8. 由0和1组成的二维矩阵，找出1的最大连通域，计算其面积。</strong></p>
+<p><strong>9. 介绍方向导数和梯度；方向导数和梯度的关系？为什么梯度在机器学习中的优化方法中有效？</strong></p>
+<p><strong>10. 一辆巴士载了25人，路经10个车站。每个乘客以相同的概率在各个车站下车。如果某个车站有乘客要下车，则大巴在该站停车。每个乘客下车的行为是独立的。记大巴停车次数为X，求X的数学期望？（要求通过编程求数学期望）</strong></p>
+<p><strong>11. 长度为n的字符串中包含m个不同的字符，如何找出包含这m个不同字符的最小子串？</strong></p>
+<p><strong>12. 如果实现c++中的vector，只需push_back和查找两个功能，底层如何实现？</strong></p>
+<p><strong>13. 如果用数组实现，数组初始容量为n，每次push到容量上限之后都扩容到原来的两倍，现在push进去m个数，m远大于n，求相比于m的时间复杂度？</strong></p>
+<p><strong>14. c++中指针和引用的区别？</strong></p>
+<ul>
+<li>指针是一个变量，只不过这个变量存储的是一个地址，指向内存的一个存储单元；而引用跟原来的变量实质上是同一个东西，只不过是原变量的一个别名而已;</li>
+<li>指针可以有多级，但是引用只能是一级（int **p；合法 而 int &amp;&amp;a是不合法的）;</li>
+<li>指针的值可以为空，但是引用的值不能为NULL，并且引用在定义的时候必须初始化;</li>
+<li>指针的值在初始化后可以改变，即指向其它的存储单元，而引用在进行初始化后就不会再改变了;</li>
+<li>“sizeof引用”得到的是所指向的变量(对象)的大小，而”sizeof指针”得到的是指针本身的大小;</li>
+<li>指针和引用的自增(++)运算意义不一样;</li>
+<li>用指针传递参数，可以实现对实参进行改变的目的，是因为传递过来的是实参的地址，因此使用*a实际上是取存储实参的内存单元里的数据，即是对实参进行改变;引用作为函数参数进行传递时，实质上传递的是实参本身，即传递进来的不是实参的一个拷贝，因此对形参的修改其实是对实参的修改，所以在用引用进行参数传递时，不仅节约时间，而且可以节约空间。</li>
+</ul>
+<figure class="highlight plain"><table><tr><td class="code"><pre><span class="line">&#x2F;** 指针和引用的例子 **&#x2F;</span><br><span class="line"> </span><br><span class="line">  std::string s1 &#x3D; &quot;萝卜&quot;;</span><br><span class="line">  std::string s2 &#x3D; &quot;青菜&quot;;</span><br><span class="line">  std::string s3 &#x3D; &quot;鸡蛋&quot;;</span><br><span class="line">  std::string s4 &#x3D; &quot;西红柿&quot;;</span><br><span class="line">  &#x2F;** 指针可以初始化为空 **&#x2F;</span><br><span class="line">  std::string *p_Str &#x3D; NULL;</span><br><span class="line">  &#x2F;** 引用一开始必须初始化 **&#x2F;</span><br><span class="line">  std::string&amp; r_Str &#x3D; s1;</span><br><span class="line"> </span><br><span class="line">  p_Str &#x3D; &amp;s2;</span><br><span class="line">  std::cout&lt;&lt;&quot;我是指针&quot;&lt;&lt;*p_Str&lt;&lt;std::endl; &#x2F;** 青菜 **&#x2F;</span><br><span class="line">  std::cout&lt;&lt;&quot;我是引用&quot;&lt;&lt;r_Str&lt;&lt;std::endl; &#x2F;** 萝卜 **&#x2F;</span><br><span class="line">  std::cout&lt;&lt;std::endl;</span><br><span class="line">  std::cout&lt;&lt;&quot;*********分别修改指针和引用***********&quot;&lt;&lt;std::endl;</span><br><span class="line">  &#x2F;** 分别修改指针和引用 **&#x2F;</span><br><span class="line">  r_Str &#x3D; s3; &#x2F;** 试图让r_Str为s3的别名 **&#x2F;</span><br><span class="line">  p_Str &#x3D; &amp;s4; &#x2F;** p_Str重新指向了s4 **&#x2F;</span><br><span class="line">   </span><br><span class="line">  std::cout&lt;&lt;&quot;我是指针&quot;&lt;&lt;*p_Str&lt;&lt;std::endl; &#x2F;** 西红柿 **&#x2F;</span><br><span class="line">  std::cout&lt;&lt;&quot;我是引用&quot;&lt;&lt;r_Str&lt;&lt;std::endl;  &#x2F;** 鸡蛋 **&#x2F;</span><br><span class="line">  std::cout&lt;&lt;std::endl;</span><br><span class="line">  std::cout&lt;&lt;&quot;*********查看刚刚的修改对最初初始化的影响***********&quot;&lt;&lt;std::endl;</span><br><span class="line">  &#x2F;** 貌似成功了，都按照意图修改了，但是，稍等 **&#x2F;</span><br><span class="line">  std::cout&lt;&lt;&quot;我是s1&quot;&lt;&lt;s1&lt;&lt;std::endl; &#x2F;** 鸡蛋 ！！！注意 ！！！ **&#x2F;</span><br><span class="line">  std::cout&lt;&lt;&quot;我是s2&quot;&lt;&lt;s2&lt;&lt;std::endl; &#x2F;** 青菜 **&#x2F;</span><br><span class="line">  std::cout&lt;&lt;&quot;我是s3&quot;&lt;&lt;s3&lt;&lt;std::endl; &#x2F;** 鸡蛋 **&#x2F;</span><br><span class="line">  std::cout&lt;&lt;&quot;我是s4&quot;&lt;&lt;s4&lt;&lt;std::endl; &#x2F;** 西红柿 **&#x2F;</span><br><span class="line"> </span><br><span class="line">  &#x2F;** </span><br><span class="line">  发现s1 &quot;萝卜&quot; 被变成了和s3一样的&quot;青菜&quot;，这也说明了任何对引用的操作都等同于操作原先的变量本身</span><br><span class="line">  相比较之下，指针就自由度很高了，想指向谁就指向谁，并不会影响任何之前指向过的变量</span><br><span class="line">  惊不惊喜，意不意外 :)</span><br><span class="line">  **&#x2F;</span><br></pre></td></tr></table></figure>
+
+<p><strong>15. 如何从用户态进入内核态？</strong></p>
+<p>用户态切换到内核态的3种方式:</p>
+<ul>
+<li><p>系统调用<br>这是用户态进程主动要求切换到内核态的一种方式，用户态进程通过系统调用申请使用操作系统提供的服务程序完成工作，比如fork()实际上就是执行了一个创建新进程的系统调用。而系统调用的机制其核心还是使用了操作系统为用户特别开放的一个中断来实现，例如Linux的int 80h中断。</p>
+</li>
+<li><p>异常<br>当CPU在执行运行在用户态下的程序时，发生了某些事先不可知的异常，这时会触发由当前运行进程切换到处理此异常的内核相关程序中，也就转到了内核态，比如缺页异常。</p>
+</li>
+<li><p>外围设备的中断<br>当外围设备完成用户请求的操作后，会向CPU发出相应的中断信号，这时CPU会暂停执行下一条即将要执行的指令转而去执行与中断信号对应的处理程序，如果先前执行的指令是用户态下的程序，那么这个转换的过程自然也就发生了由用户态到内核态的切换。比如硬盘读写操作完成，系统会切换到硬盘读写的中断处理程序中执行后续操作等。</p>
+</li>
+</ul>
+<p>这3种方式是系统在运行时由用户态转到内核态的最主要方式，其中系统调用可以认为是用户进程主动发起的，异常和外围设备中断则是被动的。</p>
+<p><strong>16. 非线性分类算法有哪些？</strong></p>
+<p><strong>17. 如何判断一个算法是线性的还是非线性的？</strong></p>
+<p><strong>18. 长度为n的数组中有一个数字出现了n/2次，如何快速找到这个数？</strong></p>
+<p><strong>19. 装饰器的用法，手写计算函数调用时间的装饰器，如果函数有返回值怎么得到，闭包。</strong></p>
+<p><strong>20. python多继承问题方法的解析顺序解析父类的同一个函数。</strong></p>
+<p><strong>21. GIL全局解释器锁是什么，怎么来的，有什么问题？</strong></p>
+]]></content>
+      <categories>
+        <category>deeplearning</category>
+      </categories>
+      <tags>
+        <tag>深度学习</tag>
+        <tag>算法</tag>
+        <tag>面试</tag>
+        <tag>笔试</tag>
+      </tags>
+  </entry>
+</search>
